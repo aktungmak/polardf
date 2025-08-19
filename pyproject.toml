@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polardf"
+version = "0.0.1"
+description = "SPARQL style queries over Polars dataframes"
+requires-python = ">=3.8"
+dependencies = [
+    "polars",
+]
