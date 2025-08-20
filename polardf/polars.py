@@ -1,0 +1,107 @@
+import itertools
+from functools import reduce
+from typing import Union
+import polars as pl
+
+from polardf.pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
+
+RDF_TYPE_IRI = "rdf:type"
+COLS = ("s", "p", "o", "g")
+SUB, PRD, OBJ, GRF = COLS
+
+
+def triple_pattern_to_df(
+        triple_pattern: TriplePattern, triples: pl.DataFrame
+) -> pl.DataFrame:
+    predicates = []
+    constraints = {}
+    renames = {}
+    df = triples.lazy()
+    for term, col_name in zip(triple_pattern, COLS):
+        if is_variable(term):
+            renames[col_name] = term._unique_name()
+        elif is_literal(term):
+            renames[col_name] = f"{col_name}_{id(term)}"
+            constraints[col_name] = term
+        # elif isinstance(term, pl.Expr):
+        #     predicates.append(term)
+        else:
+            raise SyntaxError(f"not a variable, literal or expression: {term}")
+
+    if predicates or constraints:
+        df = df.filter(*predicates, **constraints)
+    if renames:
+        df = df.rename(renames)
+    return df
+
+
+def graph_pattern_to_df(
+        graph_pattern: GraphPattern, triples: pl.DataFrame
+) -> pl.DataFrame:
+    return _multiway_natural_join(
+        *(
+            triple_pattern_to_df(triple_pattern, triples)
+            for triple_pattern in graph_pattern
+        )
+    )
+
+
+def select(
+        triples: pl.DataFrame,
+        projection,  #: Union[pl.Expr | Var],
+        where: GraphPattern,
+        optional: list[GraphPattern] = [],
+) -> pl.DataFrame:
+    where = itertools.chain.from_iterable(_expand_pattern(pattern) for pattern in where)
+
+    df = graph_pattern_to_df(where, triples)
+    for optional_graph_pattern in optional:
+        optional_df = graph_pattern_to_df(optional_graph_pattern, triples)
+        df = df.join(
+            optional_df,
+            on=set(df.collect_schema().names())
+               & set(optional_df.collect_schema().names()),
+            how="left",
+        )
+    if isinstance(projection, (list, tuple)):
+        projection = (
+            p if isinstance(p, pl.Expr) else pl.col(p._unique_name()).alias(p.name())
+            for p in projection
+        )
+    return df.select(projection)
+
+
+def construct(
+        df: pl.DataFrame, output: GraphPattern, where: GraphPattern
+) -> pl.DataFrame:
+    selection = select(df, pl.all(), where)
+    return pl.concat(selection.select(**dict(zip(COLS, pattern))) for pattern in output)
+
+
+def from_df(
+        df: pl.DataFrame, type_: str, keys: Union[list, str], key_pattern=None
+) -> pl.DataFrame:
+    if type(keys) is str:
+        keys = [keys]
+
+    if key_pattern is None:
+        joined = "/".join(["{}"] * len(keys))
+        key_pattern = f"{type_}/{joined}"
+
+    with_subject = df.with_columns(pl.format(key_pattern, *keys).alias(SUB)).drop(keys)
+    types = with_subject.select(
+        SUB, pl.lit(RDF_TYPE_IRI).alias(PRD), pl.lit(type_).alias(OBJ)
+    )
+    triples = with_subject.unpivot(
+        index=SUB, variable_name=PRD, value_name=OBJ
+    ).drop_nulls(OBJ)
+    return pl.concat([types, triples])
+
+
+def _multiway_natural_join(*dfs: pl.DataFrame) -> pl.DataFrame:
+    return reduce(
+        lambda l, r: l.join(
+            r, on=set(r.collect_schema().names()) & set(l.collect_schema().names())
+        ),
+        dfs,
+    )
