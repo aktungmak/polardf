@@ -5,13 +5,13 @@ from pyspark.sql.types import StructType, StructField, StringType
 import sys
 import os
 
-import polardf.pattern
+import rdfdf.pattern
 
-# Add the parent directory to the path to import polardf modules
+# Add the parent directory to the path to import rdfdf modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from polardf import spark as pr_spark
-from polardf.pattern import vars
+from rdfdf import spark as pr_spark
+from rdfdf.pattern import vars
 from unittest.mock import patch
 
 
@@ -38,7 +38,7 @@ def assert_dataframe_equal(df1, df2):
             raise AssertionError(f"DataFrames differ at row {i}: {row1.asDict()} vs {row2.asDict()}")
 
 
-class TestSparkRDF(unittest.TestCase):
+class TestSpark(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -100,12 +100,12 @@ class TestSparkRDF(unittest.TestCase):
 
     def test_is_variable(self):
         (v1,) = vars("v1")
-        self.assertTrue(polardf.pattern.is_variable(v1))
-        self.assertFalse(polardf.pattern.is_variable("literal"))
+        self.assertTrue(rdfdf.pattern.is_variable(v1))
+        self.assertFalse(rdfdf.pattern.is_variable("literal"))
 
     def test_is_literal(self):
-        self.assertTrue(polardf.pattern.is_literal("literal"))
-        self.assertFalse(polardf.pattern.is_literal(vars(1)))
+        self.assertTrue(rdfdf.pattern.is_literal("literal"))
+        self.assertFalse(rdfdf.pattern.is_literal(vars(1)))
 
     def test_multiway_natural_join(self):
         df1 = self.spark.createDataFrame([(1, 3), (2, 4)], ["a", "b"])
@@ -117,9 +117,9 @@ class TestSparkRDF(unittest.TestCase):
 
     # TODO move to a separate testing module
     def test_expand_pattern_p(self):
-        with patch("polardf.pattern.vars", side_effect=lambda n: list(range(n))) as mock:
+        with patch("rdfdf.pattern.vars", side_effect=lambda n: list(range(n))) as mock:
             pattern = ("s", ["p1", "p2", "p3"], "o")
-            expanded = list(polardf.pattern._expand_pattern(pattern))
+            expanded = list(rdfdf.pattern._expand_pattern(pattern))
         self.assertEqual(expanded, [('s', 'p1', 0), (0, 'p2', 1), (1, 'p3', 'o')])
 
 

@@ -4,7 +4,7 @@ from functools import reduce
 from pyspark.sql import Column, DataFrame, functions as F
 from pyspark.sql.types import StringType
 
-from polardf.pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
+from .pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
 
 RDF_TYPE_IRI = "rdf:type"
 COLS = ("s", "p", "o", "g")

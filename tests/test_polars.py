@@ -1,12 +1,12 @@
 import unittest
 import polars as pl
-import polardf as pr
+import rdfdf as pr
 
 from unittest.mock import patch
 from polars.testing import assert_frame_equal
 
 
-class TestPolaRDF(unittest.TestCase):
+class TestPolars(unittest.TestCase):
 
     def setUp(self):
         self.triples = pl.DataFrame(
@@ -88,7 +88,7 @@ class TestPolaRDF(unittest.TestCase):
         unittest.skip("TODO")
 
     def test_expand_pattern_p(self):
-        with patch("polardf.vars", side_effect=lambda n: list(range(n))) as mock:
+        with patch("rdfdf.vars", side_effect=lambda n: list(range(n))) as mock:
             pattern = ("s", ["p1", "p2", "p3"], "o")
             expanded = list(pr._expand_pattern(pattern))
         self.assertEqual(expanded, [('s', 'p1', 0), (0, 'p2', 1), (1, 'p3', 'o')])
