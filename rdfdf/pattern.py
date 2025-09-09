@@ -20,6 +20,15 @@ def vars(*names):
     return [Var(name) for name in names]
 
 
+class Scope:
+    def __getattr__(self, item):
+        if item == "__name__":
+            return self.name
+        return Var(item)
+
+
+S = Scope()
+
 TriplePattern = tuple[Union[pl.Expr, Var, str]]
 GraphPattern = list[TriplePattern]
 
