@@ -3,7 +3,7 @@ from functools import reduce
 from typing import Union
 import polars as pl
 
-from .pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
+from pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
 
 RDF_TYPE_IRI = "rdf:type"
 COLS = ("s", "p", "o", "g")
