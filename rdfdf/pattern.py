@@ -7,10 +7,10 @@ class Var:
         self.__name = name or str(id(self))
         self.__unique_name = f"{name}_{id(self)}"
 
-    def name(self):
+    def name(self) -> str:
         return self.__name
 
-    def _unique_name(self):
+    def _unique_name(self) -> str:
         return self.__unique_name
 
 
@@ -29,8 +29,58 @@ class Scope:
 
 S = Scope()
 
-TriplePattern = tuple[Union[pl.Expr, Var, str]]
+
+class IRI:
+    def __init__(self, value):
+        self.value = value
+
+    def __truediv__(self, other):
+        if isinstance(other, (IRI, Var)):
+            return Path(self, other)
+        elif isinstance(other, Path):
+            return Path(self, *other.elements)
+        else:
+            raise ValueError(f"Cannot extend Path with {type(other)}")
+
+    def __repr__(self):
+        return f"IRI({self.value})"
+
+
+class Lit:
+    def __init__(self, value):
+        self.value = value
+
+
+class Path:
+    def __init__(self, *elements: Union[IRI, Var]):
+        self.elements = list(elements)
+
+    def __truediv__(self, other) -> Self:
+        if isinstance(other, (IRI, Var)):
+            return Path(*(self.elements + [other]))
+        elif isinstance(other, Path):
+            return Path(*(self.elements + other.elements))
+        else:
+            raise ValueError(f"Cannot extend Path with {type(other)}")
+
+    def __repr__(self):
+        return f"Path({', '.join(repr(e) for e in self.elements)})"
+
+
+Term = Union[IRI, Lit, Var]
+Triple = tuple[IRI, IRI, Union[IRI, Lit]]
+TriplePattern = tuple[Term, Term, Term]
 GraphPattern = list[TriplePattern]
+
+
+def t(subject, predicate, object) -> Triple:
+    """Create a triple with IRIs for subject, predicate, and object."""
+    return (IRI(subject), IRI(predicate), IRI(object))
+
+
+def tl(subject, predicate, object) -> Triple:
+    """Create a triple with IRIs for subject and predicate, and a literal for object."""
+    return (IRI(subject), IRI(predicate), Lit(object))
 
 
 class Any:
@@ -55,7 +105,7 @@ def is_variable(term) -> bool:
 
 
 def is_literal(term) -> bool:
-    return isinstance(term, (str, int, float))
+    return isinstance(term, Lit)
 
 
 def _expand_pattern(pattern: tuple) -> list[tuple]:
