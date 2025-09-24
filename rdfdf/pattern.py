@@ -1,5 +1,5 @@
 from typing import Union
-import polars as pl
+from typing_extensions import Self
 
 
 class Var:
@@ -27,7 +27,7 @@ class Scope:
         return Var(item)
 
 
-S = Scope()
+V = Scope()
 
 
 class IRI:
@@ -42,6 +42,18 @@ class IRI:
         else:
             raise ValueError(f"Cannot extend Path with {type(other)}")
 
+    def __getitem__(self, item):
+        # exact path length
+        if isinstance(item, int):
+            elements = [self] * item
+            return Path(*elements)
+        # variable length
+        if isinstance(item, slice):
+            return StarPath(item.start, item.stop)
+        else:
+            raise IndexError(f"Can only index with int or slice")
+
+
     def __repr__(self):
         return f"IRI({self.value})"
 
@@ -50,6 +62,12 @@ class Lit:
     def __init__(self, value):
         self.value = value
 
+class StarPath:
+    def __init__(self, min, max):
+        self.min = min
+        self.max = max
+    def __repr__(self):
+        return f"StarPath({', '.join(repr(e) for e in self.elements)})"
 
 class Path:
     def __init__(self, *elements: Union[IRI, Var]):
