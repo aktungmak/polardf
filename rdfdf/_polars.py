@@ -3,7 +3,7 @@ from functools import reduce
 from typing import Union
 import polars as pl
 
-from pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern
+from .pattern import TriplePattern, GraphPattern, is_variable, is_literal, _expand_pattern, Var, is_iri
 
 RDF_TYPE_IRI = "rdf:type"
 COLS = ("s", "p", "o", "g")
@@ -12,17 +12,18 @@ SUB, PRD, OBJ, GRF = COLS
 
 def triple_pattern_to_df(
         triple_pattern: TriplePattern, triples: pl.DataFrame
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     predicates = []
     constraints = {}
     renames = {}
     df = triples.lazy()
     for term, col_name in zip(triple_pattern, COLS):
         if is_variable(term):
-            renames[col_name] = term._unique_name()
-        elif is_literal(term):
-            renames[col_name] = f"{col_name}_{id(term)}"
-            constraints[col_name] = term
+            # renames[col_name] = term._unique_name()
+            renames[col_name] = term.name()
+        elif is_literal(term) or is_iri(term):
+            # renames[col_name] = f"{col_name}_{id(term)}"
+            constraints[col_name] = term.value
         # elif isinstance(term, pl.Expr):
         #     predicates.append(term)
         else:
@@ -32,12 +33,12 @@ def triple_pattern_to_df(
         df = df.filter(*predicates, **constraints)
     if renames:
         df = df.rename(renames)
-    return df
+    return df.select(renames.values())
 
 
 def graph_pattern_to_df(
         graph_pattern: GraphPattern, triples: pl.DataFrame
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     return _multiway_natural_join(
         *(
             triple_pattern_to_df(triple_pattern, triples)
@@ -48,9 +49,9 @@ def graph_pattern_to_df(
 
 def select(
         triples: pl.DataFrame,
-        projection,  #: Union[pl.Expr | Var],
+        projection: Union[pl.Expr, Var],
         where: GraphPattern,
-        optional: list[GraphPattern] = [],
+        *optional: list[GraphPattern],
 ) -> pl.DataFrame:
     where = itertools.chain.from_iterable(_expand_pattern(pattern) for pattern in where)
 
@@ -98,7 +99,7 @@ def from_df(
     return pl.concat([types, triples])
 
 
-def _multiway_natural_join(*dfs: pl.DataFrame) -> pl.DataFrame:
+def _multiway_natural_join(*dfs: pl.LazyFrame) -> pl.LazyFrame:
     return reduce(
         lambda l, r: l.join(
             r, on=set(r.collect_schema().names()) & set(l.collect_schema().names())

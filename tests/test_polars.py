@@ -5,6 +5,9 @@ import rdfdf as pr
 from unittest.mock import patch
 from polars.testing import assert_frame_equal
 
+import rdfdf._polars as rdf
+import rdfdf.pattern as pat
+from rdfdf.pattern import V
 
 class TestPolars(unittest.TestCase):
 
@@ -18,16 +21,23 @@ class TestPolars(unittest.TestCase):
         )
 
     def test_vars(self):
-        v1, v2 = pr.vars("v1", "v2")
+        v1, v2 = pat.vars("v1", "v2")
         self.assertEqual(v1.name(), "v1")
         self.assertEqual(v2.name(), "v2")
+        self.assertEqual(pat.V.a, pat.V.a)
         self.assertNotEqual(v1._unique_name(), v2._unique_name())
+        self.assertNotEqual(pat.V.a, pat.V.b)
 
     def test_triple_pattern_to_df(self):
-        unittest.skip("TODO")
+        r = rdf.triple_pattern_to_df((pat.IRI("s1"), V.a, V.b), self.triples)
+        expected = pl.DataFrame([["p1", "o1"]], schema=list("ab"), orient="row")
+        assert_frame_equal(r.collect(), expected)
 
     def test_graph_pattern_to_df(self):
-        unittest.skip("TODO")
+        r = rdf.graph_pattern_to_df([(V.a, V.b, V.c),
+                                     (V.d, V.e, V.a)], self.triples)
+        expected = pl.DataFrame([["s1", "p1", "o1", "s3", "p3"]], schema=list("abcde"), orient="row")
+        assert_frame_equal(r.collect(), expected,)
 
     def test_select_mgq(self):
         s, p, o = pr.vars(*"spo")
