@@ -125,6 +125,9 @@ def is_variable(term) -> bool:
 def is_literal(term) -> bool:
     return isinstance(term, Lit)
 
+def is_iri(term) -> bool:
+    return isinstance(term, IRI)
+
 
 def _expand_pattern(pattern: tuple) -> list[tuple]:
     """
