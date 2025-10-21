@@ -4,7 +4,7 @@ from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Variable
 from sqlalchemy import MetaData, Table, Column, String, select, create_engine, true, Engine, CursorResult, quoted_name, \
-    CTE, Select
+    CTE, Select, and_
 from sqlalchemy.sql import column
 
 
@@ -170,7 +170,8 @@ class AlgebraTranslator:
         return query
 
     def _join_queries(self, queries):
-        """Join multiple queries on common variables."""
+        """Natural join multiple queries on common variables."""
+        # no-op if only one argument
         if len(queries) == 1:
             return queries[0]
 
@@ -192,9 +193,9 @@ class AlgebraTranslator:
                 # Build join conditions
                 join_conditions = [result.c[col] == query_cte.c[col] for col in common_cols]
 
-                # Create join query  
+                # Create join query - use and_() to combine multiple conditions
                 all_columns = list(result.c) + [col for name, col in query_cte.c.items() if name not in common_cols]
-                result = select(*all_columns).select_from(result.join(query_cte, *join_conditions))
+                result = select(*all_columns).select_from(result.join(query_cte, and_(*join_conditions)))
 
                 # Only wrap in CTE if there are more joins to come
                 if not is_last:
@@ -220,10 +221,8 @@ class AlgebraTranslator:
 
         # Get column names from base query
         if isinstance(base_query, CTE):
-            # It's a CTE
             base_cols = set(base_query.c.keys())
         elif hasattr(base_query, 'selected_columns'):
-            # It's a Select statement
             base_cols = set(col.key for col in base_query.selected_columns)
         else:
             base_cols = set()
@@ -261,9 +260,9 @@ class AlgebraTranslator:
             # All columns from both sides
             all_columns = list(left_cte.c) + [col for name, col in right_cte.c.items() if name not in common_cols]
 
-            # LEFT JOIN - return as CTE since we need to join
+            # LEFT JOIN - return as CTE since we need to join - use and_() to combine multiple conditions
             return select(*all_columns).select_from(
-                left_cte.outerjoin(right_cte, *join_conditions)
+                left_cte.outerjoin(right_cte, and_(*join_conditions))
             ).cte()
         else:
             # If no common variables, it's a cartesian product with optional semantics
@@ -279,7 +278,8 @@ if __name__ == "__main__":
     PREFIX dbx: <http://www.databricks.com/ontology/>
     SELECT *
     WHERE {
-    ?table dbx:inSchema/dbx:inCatalog ?schema .
+    ?cat a dbx:Catalog .
+    ?tab dbx:tableInSchema/dbx:inCatalog ?cat .
     }"""
 
     engine = create_databricks_engine(
@@ -293,8 +293,7 @@ if __name__ == "__main__":
         table_name="users.joshua_green.triples"
     )
 
-    # engine = create_engine("sqlite:///test.db")
-    # translator = AlgebraTranslator(engine=engine, table_name="triples", create_table=True)
-
     result = translator.execute(sparql_query)
     print("Results:", result.fetchall())
+
+    engine.dispose()
