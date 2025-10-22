@@ -70,7 +70,6 @@ class AlgebraTranslator:
 
         # If the base query is a CTE, we need to select from it
         if isinstance(base_query, CTE):
-            assert False
             return select(*base_query.c).select_from(base_query)
 
         # Otherwise, the base query is already a complete select, just return it
@@ -99,14 +98,8 @@ class AlgebraTranslator:
         for triple in triples:
             expanded_triples.extend(self._expand_path_triple(triple))
 
-        if len(expanded_triples) == 1:
-            # Single triple pattern
-            return self._triple_to_query(expanded_triples[0])
-        else:
-            # Multiple triples - need to join them
-            # TODO it might be simpler to save the joining until later
-            queries = [self._triple_to_query(triple) for triple in expanded_triples]
-            return self._join_queries(queries)
+        queries = [self._triple_to_query(triple) for triple in expanded_triples]
+        return self._join_queries(queries)
 
     def _expand_path_triple(self, triple) -> list[tuple]:
         """Expand a triple with a path predicate into multiple triples."""
