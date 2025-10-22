@@ -1,3 +1,4 @@
+import itertools
 from rdflib import Literal, URIRef
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
@@ -175,41 +176,18 @@ class AlgebraTranslator:
         if len(queries) == 1:
             return queries[0]
 
-        # Convert first query to CTE for joining
-        result = queries[0].cte()
+        # Convert all queries to CTEs
+        ctes = [query if isinstance(query, CTE) else query.cte() for query in queries]
 
-        # Join with remaining queries
-        for i, query in enumerate(queries[1:], start=1):
-            # Convert current query to CTE for joining
-            query_cte = query.cte()
+        # Generate join conditions for all pairs of CTEs based on common columns
+        conditions = []
+        for left, right in itertools.combinations(ctes, 2):
+            common_cols = set(left.c.keys()) & set(right.c.keys())
+            for col in common_cols:
+                conditions.append(left.c[col] == right.c[col])
 
-            # Find common columns (variables)
-            common_cols = set(result.c.keys()) & set(query_cte.c.keys())
-
-            # Check if this is the last join
-            is_last = (i == len(queries) - 1)
-
-            if common_cols:
-                # Build join conditions
-                join_conditions = [result.c[col] == query_cte.c[col] for col in common_cols]
-
-                # Create join query - use and_() to combine multiple conditions
-                all_columns = list(result.c) + [col for name, col in query_cte.c.items() if name not in common_cols]
-                result = select(*all_columns).select_from(result.join(query_cte, and_(*join_conditions)))
-
-                # Only wrap in CTE if there are more joins to come
-                if not is_last:
-                    result = result.cte()
-            else:
-                # Cartesian product if no common variables
-                all_columns = list(result.c) + list(query_cte.c)
-                result = select(*all_columns).select_from(result, query_cte)
-
-                # Only wrap in CTE if there are more joins to come
-                if not is_last:
-                    result = result.cte()
-
-        return result
+        # Select from all CTEs with WHERE conditions for common columns
+        return select(*ctes).select_from(*ctes).where(*conditions)
 
     def _translate_project(self, project):
         """Translate a Project (SELECT) operation."""
