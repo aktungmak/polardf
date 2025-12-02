@@ -230,6 +230,254 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
         self.assertIsNone(results_dict['<http://example.org/charlie>']['age'])
 
 
+class TestAlgebraTranslatorMulPath(unittest.TestCase):
+    """Tests for MulPath translation and execution."""
+
+    def setUp(self):
+        """Set up test fixtures with path data."""
+        # Create an in-memory SQLite database engine for testing
+        self.engine = create_engine("sqlite:///:memory:")
+        # Create the translator with a test triples table
+        self.translator = AlgebraTranslator(
+            self.engine, 
+            table_name="triples", 
+            create_table=True
+        )
+        
+        # Insert sample data for path traversal tests
+        with self.engine.connect() as conn:
+            # Create a path: start -> node1 -> node2 -> end
+            # Also: start -> alt -> end (shorter path)
+            conn.execute(self.translator.table.insert(), [
+                {'s': '<http://example.org/start>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/node1>'},
+                {'s': '<http://example.org/node1>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/node2>'},
+                {'s': '<http://example.org/node2>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/end>'},
+                {'s': '<http://example.org/start>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/alt>'},
+                {'s': '<http://example.org/alt>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/end>'},
+                # Separate path not connected to start or end
+                {'s': '<http://example.org/other1>', 'p': '<http://example.org/path_pred>', 'o': '<http://example.org/other2>'},
+            ])
+            conn.commit()
+
+    def tearDown(self):
+        """Clean up after each test method."""
+        if hasattr(self, 'engine'):
+            self.engine.dispose()
+
+    def test_translate_mulpath_unbound(self):
+        """Test translation of MulPath with both subject and object as variables."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x ?y
+        WHERE {
+            ?x ex:path_pred* ?y .
+        }"""
+        
+        # Translate the query
+        sql_query = self.translator.translate(sparql_query)
+        
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+        
+        # Check that we have the expected projection columns (x and y)
+        selected_column_names = {col.key for col in sql_query.selected_columns}
+        self.assertEqual(selected_column_names, {'x', 'y'})
+        
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_translate_mulpath_start_bound(self):
+        """Test translation of MulPath with subject bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?y
+        WHERE {
+            ex:start ex:path_pred* ?y .
+        }"""
+        
+        # Translate the query
+        sql_query = self.translator.translate(sparql_query)
+        
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+        
+        # Check that we have the expected projection column (y)
+        selected_column_names = {col.key for col in sql_query.selected_columns}
+        self.assertEqual(selected_column_names, {'y'})
+        
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_translate_mulpath_end_bound(self):
+        """Test translation of MulPath with object bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x
+        WHERE {
+            ?x ex:path_pred* ex:end .
+        }"""
+        
+        # Translate the query
+        sql_query = self.translator.translate(sparql_query)
+        
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+        
+        # Check that we have the expected projection column (x)
+        selected_column_names = {col.key for col in sql_query.selected_columns}
+        self.assertEqual(selected_column_names, {'x'})
+        
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_translate_mulpath_both_bound(self):
+        """Test translation of MulPath with both endpoints bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT *
+        WHERE {
+            ex:start ex:path_pred* ex:end .
+        }"""
+        
+        # Translate the query
+        sql_query = self.translator.translate(sparql_query)
+        
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+        
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_execute_mulpath_unbound(self):
+        """Test executing MulPath query with both variables."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x ?y
+        WHERE {
+            ?x ex:path_pred* ?y .
+        }"""
+        
+        # Execute the query
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should find transitive closure of all path_pred edges
+        self.assertGreater(len(rows), 0)
+        
+        # Convert to set of tuples for easier checking
+        result_set = {(row.x, row.y) for row in rows}
+        
+        # Should contain the direct edges
+        self.assertIn(('<http://example.org/start>', '<http://example.org/node1>'), result_set)
+        self.assertIn(('<http://example.org/node1>', '<http://example.org/node2>'), result_set)
+        
+        # Should contain transitive paths
+        self.assertIn(('<http://example.org/start>', '<http://example.org/node2>'), result_set)
+        self.assertIn(('<http://example.org/start>', '<http://example.org/end>'), result_set)
+
+    def test_execute_mulpath_start_bound(self):
+        """Test executing MulPath query with start bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?y
+        WHERE {
+            ex:start ex:path_pred* ?y .
+        }"""
+        
+        # Execute the query
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should find all nodes reachable from start
+        reachable = {row.y for row in rows}
+        
+        # Should reach all these nodes
+        expected_reachable = {
+            '<http://example.org/node1>',
+            '<http://example.org/node2>',
+            '<http://example.org/end>',
+            '<http://example.org/alt>',
+        }
+        
+        for node in expected_reachable:
+            self.assertIn(node, reachable, f"Should reach {node} from start")
+        
+        # Should NOT reach nodes not connected to start
+        self.assertNotIn('<http://example.org/other1>', reachable)
+        self.assertNotIn('<http://example.org/other2>', reachable)
+
+    def test_execute_mulpath_end_bound(self):
+        """Test executing MulPath query with end bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x
+        WHERE {
+            ?x ex:path_pred* ex:end .
+        }"""
+        
+        # Execute the query
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should find all nodes that can reach end
+        can_reach_end = {row.x for row in rows}
+        
+        # Should include all these nodes
+        expected_sources = {
+            '<http://example.org/start>',
+            '<http://example.org/node1>',
+            '<http://example.org/node2>',
+            '<http://example.org/alt>',
+        }
+        
+        for node in expected_sources:
+            self.assertIn(node, can_reach_end, f"{node} should be able to reach end")
+        
+        # Should NOT include nodes that can't reach end
+        self.assertNotIn('<http://example.org/other1>', can_reach_end)
+        self.assertNotIn('<http://example.org/other2>', can_reach_end)
+
+    def test_execute_mulpath_both_bound(self):
+        """Test executing MulPath query with both endpoints bound."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        ASK {
+            ex:start ex:path_pred* ex:end .
+        }"""
+        
+        # For ASK queries, we just check if any results exist
+        # Since ASK is not implemented, we'll use SELECT instead
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT *
+        WHERE {
+            ex:start ex:path_pred* ex:end .
+        }"""
+        
+        # Execute the query
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should find at least one path from start to end
+        self.assertGreater(len(rows), 0, "Should find path from start to end")
+
+
 if __name__ == '__main__':
     unittest.main()
 

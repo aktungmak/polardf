@@ -94,21 +94,28 @@ class AlgebraTranslator:
         triples = bgp["triples"]
 
         # Expand any path predicates
-        expanded_triples = []
+        expanded_items = []
         for triple in triples:
-            expanded_triples.extend(self._expand_path_triple(triple))
+            expanded_items.extend(self._expand_triple(triple))
 
-        queries = [self._triple_to_query(triple) for triple in expanded_triples]
+        # Convert triples to queries (MulPath already returns queries)
+        queries = []
+        for item in expanded_items:
+            if isinstance(item, Select):
+                queries.append(item)
+            else:
+                queries.append(self._triple_to_query(item))
+        
         return self._join_queries(queries)
 
-    def _expand_path_triple(self, triple) -> list[tuple]:
-        """Expand a triple with a path predicate into multiple triples."""
+    def _expand_triple(self, triple):
+        """Expand a triple with a path predicate into triples or queries."""
         s, p, o = triple
 
         if not isinstance(p, Path):
             return [triple]
 
-        # Handle SequencePath (e.g., <a>/<b>/<c>)
+        # SequencePath (e.g. :a/:b/:c)
         if isinstance(p, SequencePath):
             temp_vars = [Variable(f"_path_{id(p)}_{i}") for i in range(len(p.args) - 1)]
             subjects = [s] + temp_vars
@@ -116,10 +123,9 @@ class AlgebraTranslator:
             objects = temp_vars + [o]
             return list(zip(subjects, predicates, objects))
 
+        # MulPath (e.g. :a*)
         elif isinstance(p, MulPath):
-            # TODO implement this using a recursive query
-            NotImplementedError("MulPath not yet implemented")
-            pass
+            return [self._mulpath_to_cte(s, p, o)]
         else:
             raise NotImplementedError(f"Path type {type(p)} not implemented")
 
@@ -163,6 +169,69 @@ class AlgebraTranslator:
 
         return query
 
+    def _mulpath_to_cte(self, s, mulpath: MulPath, o):
+        """Generate a recursive CTE for MulPath evaluation.
+        
+        Generates a transitive closure query, optionally filtered by bound endpoints.
+        """
+        # Get the predicate to follow
+        if not isinstance(mulpath.path, URIRef):
+            raise NotImplementedError(f"MulPath with path type {type(mulpath.path)} not implemented")
+        
+        pred_value = f"<{mulpath.path}>"
+
+        # Convert bound values to strings for comparison
+        s_value = f"<{s}>" if isinstance(s, URIRef) else None
+        o_value = f"<{o}>" if isinstance(o, URIRef) else str(o) if isinstance(o, Literal) else None
+
+        # Base case: all direct edges with the predicate
+        base_query = select(
+            self.table.c.s,
+            self.table.c.p,
+            self.table.c.o
+        ).where(self.table.c.p == pred_value)
+
+        # Create recursive CTE
+        # TODO: make CTE name unique for multiple path expressions
+        path_cte = base_query.cte(name='path_cte', recursive=True)
+
+        # Recursive case: extend paths forward
+        recursive_query = select(
+            path_cte.c.s,  # Keep original starting node
+            self.table.c.p,
+            self.table.c.o  # Extend to new destinations
+        ).select_from(
+            path_cte.join(self.table, path_cte.c.o == self.table.c.s)
+        ).where(self.table.c.p == pred_value)
+
+        # Union base and recursive parts
+        path_cte = path_cte.union(recursive_query)
+
+        # Build result columns with variable labels
+        result_columns = []
+        if isinstance(s, Variable):
+            result_columns.append(path_cte.c.s.label(str(s)))
+        if isinstance(o, Variable):
+            result_columns.append(path_cte.c.o.label(str(o)))
+        
+        # If no variables, still need to select something for filtering
+        if not result_columns:
+            result_columns = [path_cte.c.s, path_cte.c.o]
+
+        # Build final query with filters for bound endpoints
+        final_query = select(*result_columns).select_from(path_cte)
+        
+        conditions = []
+        if s_value is not None:
+            conditions.append(path_cte.c.s == s_value)
+        if o_value is not None:
+            conditions.append(path_cte.c.o == o_value)
+        
+        if conditions:
+            final_query = final_query.where(and_(*conditions))
+
+        return final_query
+
     def _join_queries(self, queries):
         """Natural join multiple queries on common variables."""
         # no-op if only one argument
@@ -202,6 +271,12 @@ class AlgebraTranslator:
 
         if base_cols == project_var_names:
             # Projection doesn't change anything, return base query
+            return base_query
+
+        # Handle empty projections (e.g., when all terms are bound)
+        if len(project_vars) == 0:
+            # For empty projections, return base query as-is
+            # This allows MulPath queries with bound endpoints to still work
             return base_query
 
         # Apply projection - use subquery to avoid unnecessary CTE
