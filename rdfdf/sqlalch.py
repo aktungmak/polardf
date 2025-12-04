@@ -1,12 +1,26 @@
 import itertools
+from typing import List, Optional, Union
+
 from rdflib import Literal, URIRef
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Variable
 from sqlalchemy import MetaData, Table, Column, String, select, create_engine, true, Engine, CursorResult, quoted_name, \
-    CTE, Select, and_
+    CTE, Select, and_, null
 from sqlalchemy.sql import column
+
+
+def term_to_string(term) -> Optional[str]:
+    """Convert an RDF term (URIRef or Literal) to its string representation.
+    
+    Returns None if the term is not a URIRef or Literal (e.g., a Variable).
+    """
+    if isinstance(term, URIRef):
+        return f"<{term}>"
+    elif isinstance(term, Literal):
+        return str(term)
+    return None
 
 
 def create_databricks_engine(
@@ -20,7 +34,8 @@ def create_databricks_engine(
 
 
 class AlgebraTranslator:
-    """Translates SPARQL algebra expressions to SQLAlchemy queries."""
+    """Translates SPARQL algebra expressions to SQLAlchemy queries.
+    The assumption is that the triples are stored in a table with columns s, p, and o."""
 
     def __init__(
             self,
@@ -30,6 +45,7 @@ class AlgebraTranslator:
     ):
         self.engine = engine
         self.metadata = MetaData()
+        self._cte_counter = itertools.count()
 
         # Define the triple table structure
         self.table = Table(
@@ -40,7 +56,6 @@ class AlgebraTranslator:
             Column('o', String, nullable=False, primary_key=True),
         )
 
-        # Only create table if explicitly requested
         if create_table:
             self.metadata.create_all(self.engine)
 
@@ -65,8 +80,7 @@ class AlgebraTranslator:
         raise NotImplementedError(f"Algebra translation not implemented for {query_algebra}")
 
     def _translate_select_query(self, select_query: CompValue):
-        pattern = select_query["p"]
-        base_query = self._translate_pattern(pattern)
+        base_query = self._translate_pattern(select_query["p"])
 
         # If the base query is a CTE, we need to select from it
         if isinstance(base_query, CTE):
@@ -89,39 +103,41 @@ class AlgebraTranslator:
         else:
             raise ValueError(f"Unknown pattern type: {pattern}")
 
-    def _translate_bgp(self, bgp):
+    def _translate_bgp(self, bgp: CompValue) -> Union[Select, CTE]:
         """Translate a Basic Graph Pattern to a query."""
         triples = bgp["triples"]
-
-        # Expand any path predicates
-        expanded_items = []
-        for triple in triples:
-            expanded_items.extend(self._expand_triple(triple))
-
-        # Convert triples to queries (MulPath already returns queries)
+        
+        # Empty BGP = single solution with no bindings = SELECT 1
+        if not triples:
+            return select(column("1"))
+        
         queries = []
-        for item in expanded_items:
-            if isinstance(item, Select):
-                queries.append(item)
-            else:
-                queries.append(self._triple_to_query(item))
+        for triple in triples:
+            queries.extend(self._expand_triple(triple))
         
         return self._join_queries(queries)
 
-    def _expand_triple(self, triple):
-        """Expand a triple with a path predicate into triples or queries."""
+    def _expand_triple(self, triple: tuple) -> List[Select]:
+        """Expand a triple pattern into one or more Select queries.
+        
+        Handles:
+        - Simple triples: returns a single query
+        - SequencePath (e.g. :a/:b/:c): returns queries for each step
+        - MulPath (e.g. :a*): returns a recursive CTE query
+        """
         s, p, o = triple
 
         if not isinstance(p, Path):
-            return [triple]
+            return [self._triple_to_query(triple)]
 
         # SequencePath (e.g. :a/:b/:c)
-        if isinstance(p, SequencePath):
+        elif isinstance(p, SequencePath):
             temp_vars = [Variable(f"_path_{id(p)}_{i}") for i in range(len(p.args) - 1)]
             subjects = [s] + temp_vars
             predicates = p.args
             objects = temp_vars + [o]
-            return list(zip(subjects, predicates, objects))
+            expanded_triples = list(zip(subjects, predicates, objects))
+            return [self._triple_to_query(t) for t in expanded_triples]
 
         # MulPath (e.g. :a*)
         elif isinstance(p, MulPath):
@@ -140,26 +156,32 @@ class AlgebraTranslator:
         # Subject
         if isinstance(s, Variable):
             columns.append(self.table.c.s.label(str(s)))
-        elif isinstance(s, URIRef):
-            conditions.append(self.table.c.s == f"<{s}>")
+        elif (s_str := term_to_string(s)) is not None:
+            conditions.append(self.table.c.s == s_str)
         else:
             raise NotImplementedError(f"Subject type {type(s)} not implemented")
 
         # Predicate  
         if isinstance(p, Variable):
-            columns.append(self.table.c.p.label(str(p)))
-        elif isinstance(p, URIRef):
-            conditions.append(self.table.c.p == f"<{p}>")
+            if p == s:  # Same variable as subject
+                conditions.append(self.table.c.p == self.table.c.s)
+            else:
+                columns.append(self.table.c.p.label(str(p)))
+        elif (p_str := term_to_string(p)) is not None:
+            conditions.append(self.table.c.p == p_str)
         else:
             raise NotImplementedError(f"Predicate type {type(p)} not implemented")
 
         # Object
         if isinstance(o, Variable):
-            columns.append(self.table.c.o.label(str(o)))
-        elif isinstance(o, URIRef):
-            conditions.append(self.table.c.o == f"<{o}>")
-        elif isinstance(o, Literal):
-            conditions.append(self.table.c.o == str(o))
+            if o == s:  # Same variable as subject
+                conditions.append(self.table.c.o == self.table.c.s)
+            elif o == p:  # Same variable as predicate
+                conditions.append(self.table.c.o == self.table.c.p)
+            else:
+                columns.append(self.table.c.o.label(str(o)))
+        elif (o_str := term_to_string(o)) is not None:
+            conditions.append(self.table.c.o == o_str)
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
 
@@ -175,14 +197,13 @@ class AlgebraTranslator:
         Generates a transitive closure query, optionally filtered by bound endpoints.
         """
         # Get the predicate to follow
-        if not isinstance(mulpath.path, URIRef):
+        pred_value = term_to_string(mulpath.path)
+        if pred_value is None:
             raise NotImplementedError(f"MulPath with path type {type(mulpath.path)} not implemented")
-        
-        pred_value = f"<{mulpath.path}>"
 
         # Convert bound values to strings for comparison
-        s_value = f"<{s}>" if isinstance(s, URIRef) else None
-        o_value = f"<{o}>" if isinstance(o, URIRef) else str(o) if isinstance(o, Literal) else None
+        s_value = term_to_string(s)
+        o_value = term_to_string(o)
 
         # Base case: all direct edges with the predicate
         base_query = select(
@@ -191,9 +212,9 @@ class AlgebraTranslator:
             self.table.c.o
         ).where(self.table.c.p == pred_value)
 
-        # Create recursive CTE
-        # TODO: make CTE name unique for multiple path expressions
-        path_cte = base_query.cte(name='path_cte', recursive=True)
+        # Create recursive CTE with unique name
+        cte_name = f"path_cte_{next(self._cte_counter)}"
+        path_cte = base_query.cte(name=cte_name, recursive=True)
 
         # Recursive case: extend paths forward
         recursive_query = select(
@@ -279,9 +300,19 @@ class AlgebraTranslator:
             # This allows MulPath queries with bound endpoints to still work
             return base_query
 
-        # Apply projection - use subquery to avoid unnecessary CTE
-        var_columns = [column(str(var)) for var in project_vars]
-        return select(*var_columns).select_from(base_query.subquery())
+        # Build projection columns
+        # - Variables that exist in base query: select from subquery
+        # - Variables that don't exist: add as NULL (unbound in SPARQL)
+        subquery = base_query.subquery()
+        var_columns = []
+        for var in project_vars:
+            var_name = str(var)
+            if var_name in base_cols:
+                var_columns.append(column(var_name))
+            else:
+                var_columns.append(null().label(var_name))
+        
+        return select(*var_columns).select_from(subquery)
 
     def _translate_left_join(self, left_join):
         """Translate a LeftJoin (OPTIONAL) operation."""

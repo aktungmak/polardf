@@ -229,6 +229,117 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
         self.assertEqual(results_dict['<http://example.org/charlie>']['name'], 'Charlie')
         self.assertIsNone(results_dict['<http://example.org/charlie>']['age'])
 
+    def test_execute_same_variable_triple_pattern(self):
+        """Test executing a query where the same variable appears multiple times.
+        
+        When a variable appears in multiple positions (e.g., ?x ?x ?x), the query
+        should only return triples where those positions have equal values.
+        """
+        # Insert a triple where s=p=o for testing
+        with self.engine.connect() as conn:
+            conn.execute(self.translator.table.insert(), [
+                {'s': '<http://example.org/same>', 'p': '<http://example.org/same>', 'o': '<http://example.org/same>'},
+            ])
+            conn.commit()
+
+        # Test ?x ?x ?x - should only match triples where s=p=o
+        sparql_query = """
+        SELECT ?x WHERE { ?x ?x ?x }
+        """
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should only return the one triple where s=p=o
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].x, '<http://example.org/same>')
+
+        # Test ?x ?p ?x - should only match triples where s=o
+        sparql_query2 = """
+        SELECT ?x ?p WHERE { ?x ?p ?x }
+        """
+        result2 = self.translator.execute(sparql_query2)
+        rows2 = result2.fetchall()
+        
+        # Should only return the triple where s=o
+        self.assertEqual(len(rows2), 1)
+        self.assertEqual(rows2[0].x, '<http://example.org/same>')
+
+    def test_execute_empty_bgp(self):
+        """Test executing a query with an empty BGP (no triple patterns).
+        
+        An empty BGP represents a single solution with no bindings,
+        so it should return exactly one row.
+        """
+        sparql_query = "SELECT * WHERE {}"
+        
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Empty BGP should return exactly one row (single solution with no bindings)
+        self.assertEqual(len(rows), 1)
+
+    def test_execute_empty_bgp_with_projection(self):
+        """Test executing a query that projects a variable from an empty BGP.
+        
+        In SPARQL, SELECT ?x WHERE {} should return one row with ?x unbound (NULL).
+        """
+        sparql_query = "SELECT ?x WHERE {}"
+        
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should return one row with x = NULL (unbound)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].x)
+
+    def test_execute_projection_nonexistent_variable(self):
+        """Test projecting a variable that doesn't exist in the pattern.
+        
+        SELECT ?z WHERE { ?x ex:knows ?y } should return rows with z = NULL.
+        """
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?z WHERE { ?x ex:parent ?y }
+        """
+        
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should return rows (one per match) with z = NULL
+        self.assertEqual(len(rows), 2)  # alice->bob, bob->charlie
+        for row in rows:
+            self.assertIsNone(row.z)
+
+    def test_execute_projection_mixed_variables(self):
+        """Test projecting a mix of existing and non-existing variables.
+        
+        SELECT ?person ?missing WHERE { ?person ex:name ?name } should return
+        rows with person bound and missing = NULL.
+        """
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?person ?missing WHERE { ?person ex:name ?name }
+        """
+        
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        
+        # Should return 3 rows (alice, bob, charlie have names)
+        self.assertEqual(len(rows), 3)
+        
+        persons = set()
+        for row in rows:
+            self.assertIsNotNone(row.person)
+            self.assertIsNone(row.missing)
+            persons.add(row.person)
+        
+        # Verify all three people are returned
+        self.assertEqual(persons, {
+            '<http://example.org/alice>',
+            '<http://example.org/bob>',
+            '<http://example.org/charlie>',
+        })
+
 
 class TestAlgebraTranslatorMulPath(unittest.TestCase):
     """Tests for MulPath translation and execution."""
