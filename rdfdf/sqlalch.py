@@ -98,6 +98,8 @@ class AlgebraTranslator:
                 return self._translate_project(pattern)
             elif pattern.name == "LeftJoin":
                 return self._translate_left_join(pattern)
+            elif pattern.name == "Distinct":
+                return self._translate_distinct(pattern)
             else:
                 raise NotImplementedError(f"Pattern type {pattern.name} not implemented")
         else:
@@ -313,6 +315,17 @@ class AlgebraTranslator:
                 var_columns.append(null().label(var_name))
         
         return select(*var_columns).select_from(subquery)
+
+    def _translate_distinct(self, distinct):
+        """Translate a Distinct operation."""
+        inner_query = self._translate_pattern(distinct["p"])
+        
+        # If it's a CTE, select from it with distinct
+        if isinstance(inner_query, CTE):
+            return select(*inner_query.c).select_from(inner_query).distinct()
+        
+        # Otherwise apply distinct directly
+        return inner_query.distinct()
 
     def _translate_left_join(self, left_join):
         """Translate a LeftJoin (OPTIONAL) operation."""

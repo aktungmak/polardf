@@ -340,6 +340,20 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
             '<http://example.org/charlie>',
         })
 
+    def test_execute_distinct(self):
+        """Test that SELECT DISTINCT removes duplicate rows."""
+        # Without DISTINCT: returns one row per triple (duplicates for ?person)
+        result = self.translator.execute("SELECT ?person WHERE { ?person ?p ?o }")
+        rows = result.fetchall()
+        persons = [row.person for row in rows]
+        self.assertGreater(len(persons), len(set(persons)), "Should have duplicates without DISTINCT")
+        
+        # With DISTINCT: each person appears exactly once
+        result = self.translator.execute("SELECT DISTINCT ?person WHERE { ?person ?p ?o }")
+        rows = result.fetchall()
+        persons = [row.person for row in rows]
+        self.assertEqual(len(persons), len(set(persons)), "DISTINCT should eliminate duplicates")
+
 
 class TestAlgebraTranslatorMulPath(unittest.TestCase):
     """Tests for MulPath translation and execution."""
