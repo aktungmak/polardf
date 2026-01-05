@@ -654,6 +654,13 @@ class AlgebraTranslator:
             if fname in ("SHA1", "SHA256", "SHA384", "SHA512"):
                 return getattr(func, fname.lower())(*args)
 
+            # --- RDF term comparison ---
+            if fname == "SAMETERM":
+                # sameTerm(?a, ?b) tests if two RDF terms are identical
+                arg1 = self._translate_expr(expr.arg1, ctx)
+                arg2 = self._translate_expr(expr.arg2, ctx)
+                return arg1 == arg2
+
             # --- RDF term helpers (schema-dependent) ---
             if fname in (
                 "LANG",
@@ -665,8 +672,9 @@ class AlgebraTranslator:
             ):
                 raise NotImplementedError(f"{fname} requires schema-specific mapping")
 
-            # Fallback: generic SQL function
-            return getattr(func, fname.lower())(*args)
+            raise NotImplementedError(
+                f"SPARQL built-in function {fname} is not supported"
+            )
 
         # ---------- Aggregates as expressions ----------
         if name == "Aggregate":
