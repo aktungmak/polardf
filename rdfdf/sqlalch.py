@@ -6,14 +6,33 @@ from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Variable
-from sqlalchemy import MetaData, Table, Column, String, select, create_engine, true, Engine, CursorResult, quoted_name, \
-    CTE, Select, and_, null, literal, case, func, or_, not_
+from sqlalchemy import (
+    MetaData,
+    Table,
+    Column,
+    String,
+    select,
+    create_engine,
+    true,
+    Engine,
+    CursorResult,
+    quoted_name,
+    CTE,
+    Select,
+    and_,
+    null,
+    literal,
+    case,
+    func,
+    or_,
+    not_,
+)
 from sqlalchemy.sql import column
 
 
 def term_to_string(term) -> Optional[str]:
     """Convert an RDF term (URIRef or Literal) to its string representation.
-    
+
     Returns None if the term is not a URIRef or Literal (e.g., a Variable).
     """
     if isinstance(term, URIRef):
@@ -24,24 +43,21 @@ def term_to_string(term) -> Optional[str]:
 
 
 def create_databricks_engine(
-        server_hostname: str,
-        http_path: str,
-        access_token: str,
-        **engine_kwargs
+    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
-    engine_uri = f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
+    engine_uri = (
+        f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
+    )
     return create_engine(engine_uri, **engine_kwargs)
 
 
 class AlgebraTranslator:
     """Translates SPARQL algebra expressions to SQLAlchemy queries.
-    The assumption is that the triples are stored in a table with columns s, p, and o."""
+    The assumption is that the triples are stored in a table with columns s, p, and o.
+    """
 
     def __init__(
-            self,
-            engine: Engine,
-            table_name: str = "triples",
-            create_table: bool = False
+        self, engine: Engine, table_name: str = "triples", create_table: bool = False
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -51,9 +67,9 @@ class AlgebraTranslator:
         self.table = Table(
             quoted_name(table_name, quote=False),
             self.metadata,
-            Column('s', String, nullable=False, primary_key=True),
-            Column('p', String, nullable=False, primary_key=True),
-            Column('o', String, nullable=False, primary_key=True),
+            Column("s", String, nullable=False, primary_key=True),
+            Column("p", String, nullable=False, primary_key=True),
+            Column("o", String, nullable=False, primary_key=True),
         )
 
         # TODO create a symbol table alterantive like this
@@ -65,22 +81,20 @@ class AlgebraTranslator:
     def execute(self, sparql_query: str) -> CursorResult:
         """Translate a SPARQL query and execute it."""
         sql_query = self.translate(sparql_query)
-        print("translated:\n", sql_query)
         with self.engine.connect() as conn:
             return conn.execute(sql_query)
 
     def translate(self, sparql_string: str):
         """Translate a SPARQL query string to a SQLAlchemy query."""
         query_tree = parser.parseQuery(sparql_string)
-        query_algebra = algebra.translateQuery(query_tree)
-        print("algebra:")
-        algebra.pprintAlgebra(query_algebra)
-        query_algebra = query_algebra.algebra
-        if hasattr(query_algebra, 'name'):
+        query_algebra = algebra.translateQuery(query_tree).algebra
+        if hasattr(query_algebra, "name"):
             if query_algebra.name == "SelectQuery":
                 return self._translate_select_query(query_algebra)
 
-        raise NotImplementedError(f"Algebra translation not implemented for {query_algebra}")
+        raise NotImplementedError(
+            f"Algebra translation not implemented for {query_algebra}"
+        )
 
     def _translate_select_query(self, select_query: CompValue):
         base_query = self._translate_pattern(select_query["p"])
@@ -94,7 +108,7 @@ class AlgebraTranslator:
 
     def _translate_pattern(self, pattern):
         """Translate different pattern types."""
-        if hasattr(pattern, 'name'):
+        if hasattr(pattern, "name"):
             if pattern.name == "BGP":
                 return self._translate_bgp(pattern)
             elif pattern.name == "Project":
@@ -105,28 +119,32 @@ class AlgebraTranslator:
                 return self._translate_distinct(pattern)
             elif pattern.name == "Extend":
                 return self._translate_extend(pattern)
+            elif pattern.name == "Filter":
+                return self._translate_filter(pattern)
             else:
-                raise NotImplementedError(f"Pattern type {pattern.name} not implemented")
+                raise NotImplementedError(
+                    f"Pattern type {pattern.name} not implemented"
+                )
         else:
             raise ValueError(f"Unknown pattern type: {pattern}")
 
     def _translate_bgp(self, bgp: CompValue) -> Union[Select, CTE]:
         """Translate a Basic Graph Pattern to a query."""
         triples = bgp["triples"]
-        
+
         # Empty BGP = single solution with no bindings = SELECT 1
         if not triples:
             return select(column("1"))
-        
+
         queries = []
         for triple in triples:
             queries.extend(self._expand_triple(triple))
-        
+
         return self._join_queries(queries)
 
     def _expand_triple(self, triple: tuple) -> List[Select]:
         """Expand a triple pattern into one or more Select queries.
-        
+
         Handles:
         - Simple triples: returns a single query
         - SequencePath (e.g. :a/:b/:c): returns queries for each step
@@ -168,7 +186,7 @@ class AlgebraTranslator:
         else:
             raise NotImplementedError(f"Subject type {type(s)} not implemented")
 
-        # Predicate  
+        # Predicate
         if isinstance(p, Variable):
             if p == s:  # Same variable as subject
                 conditions.append(self.table.c.p == self.table.c.s)
@@ -200,35 +218,38 @@ class AlgebraTranslator:
 
     def _mulpath_to_cte(self, s, mulpath: MulPath, o):
         """Generate a recursive CTE for MulPath evaluation.
-        
+
         Generates a transitive closure query, optionally filtered by bound endpoints.
         """
         # Get the predicate to follow
         pred_value = term_to_string(mulpath.path)
         if pred_value is None:
-            raise NotImplementedError(f"MulPath with path type {type(mulpath.path)} not implemented")
+            raise NotImplementedError(
+                f"MulPath with path type {type(mulpath.path)} not implemented"
+            )
 
         # Convert bound values to strings for comparison
         s_value = term_to_string(s)
         o_value = term_to_string(o)
 
         # Base case: all direct edges with the predicate (only need s and o, not p)
-        base_query = select(
-            self.table.c.s,
-            self.table.c.o
-        ).where(self.table.c.p == pred_value)
+        base_query = select(self.table.c.s, self.table.c.o).where(
+            self.table.c.p == pred_value
+        )
 
         # Create recursive CTE with unique name
         cte_name = f"path_cte_{next(self._cte_counter)}"
         path_cte = base_query.cte(name=cte_name, recursive=True)
 
         # Recursive case: extend paths forward
-        recursive_query = select(
-            path_cte.c.s,  # Keep original starting node
-            self.table.c.o  # Extend to new destinations
-        ).select_from(
-            path_cte.join(self.table, path_cte.c.o == self.table.c.s)
-        ).where(self.table.c.p == pred_value)
+        recursive_query = (
+            select(
+                path_cte.c.s,  # Keep original starting node
+                self.table.c.o,  # Extend to new destinations
+            )
+            .select_from(path_cte.join(self.table, path_cte.c.o == self.table.c.s))
+            .where(self.table.c.p == pred_value)
+        )
 
         # Union base and recursive parts
         path_cte = path_cte.union(recursive_query)
@@ -239,20 +260,20 @@ class AlgebraTranslator:
             result_columns.append(path_cte.c.s.label(str(s)))
         if isinstance(o, Variable):
             result_columns.append(path_cte.c.o.label(str(o)))
-        
+
         # If no variables, still need to select something for filtering
         if not result_columns:
             result_columns = [path_cte.c.s, path_cte.c.o]
 
         # Build final query with filters for bound endpoints
         final_query = select(*result_columns).select_from(path_cte)
-        
+
         conditions = []
         if s_value is not None:
             conditions.append(path_cte.c.s == s_value)
         if o_value is not None:
             conditions.append(path_cte.c.o == o_value)
-        
+
         if conditions:
             final_query = final_query.where(and_(*conditions))
 
@@ -294,7 +315,7 @@ class AlgebraTranslator:
         # Get column names from base query
         if isinstance(base_query, CTE):
             base_cols = set(base_query.c.keys())
-        elif hasattr(base_query, 'selected_columns'):
+        elif hasattr(base_query, "selected_columns"):
             base_cols = set(col.key for col in base_query.selected_columns)
         else:
             base_cols = set()
@@ -322,49 +343,76 @@ class AlgebraTranslator:
                 var_columns.append(column(var_name))
             else:
                 var_columns.append(null().label(var_name))
-        
+
         return select(*var_columns).select_from(subquery)
 
     def _translate_distinct(self, distinct):
         """Translate a Distinct operation."""
         inner_query = self._translate_pattern(distinct["p"])
-        
+
         # If it's a CTE, select from it with distinct
         if isinstance(inner_query, CTE):
             return select(*inner_query.c).select_from(inner_query).distinct()
-        
+
         # Otherwise apply distinct directly
         return inner_query.distinct()
 
     def _translate_extend(self, extend):
         """Translate an Extend (BIND) operation.
-        
+
         The Extend node adds a new variable binding computed from an expression.
         Structure: Extend(p=inner_pattern, var=new_variable_name, expr=expression)
         """
         inner_pattern = extend["p"]
         var_name = str(extend["var"])
         expr = extend["expr"]
-        
+
         # Translate the inner pattern
         inner_query = self._translate_pattern(inner_pattern)
-        
+
         # Convert to subquery so we can add columns
         if isinstance(inner_query, CTE):
             subquery = inner_query
         else:
             subquery = inner_query.subquery()
-        
+
         # Build a context mapping variable names to columns from the subquery
         ctx = {name: subquery.c[name] for name in subquery.c.keys()}
-        
+
         # Translate the expression
         sql_expr = self._translate_expr(expr, ctx)
-        
+
         # Build result columns: all existing columns plus the new computed column
         result_columns = list(subquery.c) + [sql_expr.label(var_name)]
-        
+
         return select(*result_columns).select_from(subquery)
+
+    def _translate_filter(self, filter_node):
+        """Translate a Filter operation.
+
+        Filter applies a boolean expression to filter results from the inner pattern.
+        Structure: Filter(p=inner_pattern, expr=boolean_expression)
+        """
+        inner_pattern = filter_node["p"]
+        filter_expr = filter_node["expr"]
+
+        # Translate the inner pattern
+        inner_query = self._translate_pattern(inner_pattern)
+
+        # Build context from available columns
+        if isinstance(inner_query, CTE):
+            ctx = {name: inner_query.c[name] for name in inner_query.c.keys()}
+            base_select = select(*inner_query.c).select_from(inner_query)
+        else:
+            # It's a Select - get columns and add WHERE directly
+            ctx = {col.key: col for col in inner_query.selected_columns}
+            base_select = inner_query
+
+        # Translate the filter expression
+        sql_condition = self._translate_expr(filter_expr, ctx)
+
+        # Add WHERE clause directly (no extra subquery)
+        return base_select.where(sql_condition)
 
     def _translate_left_join(self, left_join):
         """Translate a LeftJoin (OPTIONAL) operation."""
@@ -384,10 +432,14 @@ class AlgebraTranslator:
         common_cols = set(left_cte.c.keys()) & set(right_cte.c.keys())
 
         if common_cols:
-            join_conditions = [left_cte.c[col] == right_cte.c[col] for col in common_cols]
+            join_conditions = [
+                left_cte.c[col] == right_cte.c[col] for col in common_cols
+            ]
 
             # All columns from both sides (deduplicated - common cols only from left)
-            all_columns = list(left_cte.c) + [col for name, col in right_cte.c.items() if name not in common_cols]
+            all_columns = list(left_cte.c) + [
+                col for name, col in right_cte.c.items() if name not in common_cols
+            ]
 
             # LEFT JOIN - return Select (caller can wrap in CTE if needed)
             return select(*all_columns).select_from(
@@ -400,12 +452,10 @@ class AlgebraTranslator:
                 left_cte.outerjoin(right_cte, true())
             )
 
-
-
     def _translate_expr(self, expr, ctx):
         """Translate an rdflib SPARQL algebra expression (CompValue / term)
         into a SQLAlchemy expression.
-        
+
         Args:
             expr: The expression to translate (Variable, Literal, or CompValue)
             ctx: A dict mapping variable names to SQLAlchemy columns
@@ -416,11 +466,11 @@ class AlgebraTranslator:
             if var_name in ctx:
                 return ctx[var_name]
             raise ValueError(f"Variable ?{var_name} not found in context")
-        
+
         # Base case: Literal - convert to SQL literal
         if isinstance(expr, Literal):
             return literal(str(expr))
-        
+
         # Base case: URIRef - convert to SQL literal string
         if isinstance(expr, URIRef):
             return literal(f"<{expr}>")
@@ -451,17 +501,21 @@ class AlgebraTranslator:
             raise NotImplementedError(f"Relational op {op!r} not supported")
 
         if name == "ConditionalAndExpression":
-            return and_(*[self._translate_expr(e, ctx) for e in expr.other])
+            operands = [self._translate_expr(expr.expr, ctx)]
+            operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+            return and_(*operands)
         if name == "ConditionalOrExpression":
-            return or_(*[self._translate_expr(e, ctx) for e in expr.other])
+            operands = [self._translate_expr(expr.expr, ctx)]
+            operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+            return or_(*operands)
         if name == "UnaryNot":
             return not_(self._translate_expr(expr.expr, ctx))
 
         # ---------- Arithmetic ----------
         if name == "AdditiveExpression":
             base = self._translate_expr(expr.expr, ctx)
-            ops = expr.op if hasattr(expr, 'op') else []
-            others = expr.other if hasattr(expr, 'other') else []
+            ops = expr.op if hasattr(expr, "op") else []
+            others = expr.other if hasattr(expr, "other") else []
             for op, other in zip(ops, others):
                 rhs = self._translate_expr(other, ctx)
                 if op == "+":
@@ -474,8 +528,8 @@ class AlgebraTranslator:
 
         if name == "MultiplicativeExpression":
             base = self._translate_expr(expr.expr, ctx)
-            ops = expr.op if hasattr(expr, 'op') else []
-            others = expr.other if hasattr(expr, 'other') else []
+            ops = expr.op if hasattr(expr, "op") else []
+            others = expr.other if hasattr(expr, "other") else []
             for op, other in zip(ops, others):
                 rhs = self._translate_expr(other, ctx)
                 if op == "*":
@@ -495,7 +549,7 @@ class AlgebraTranslator:
         # ---------- Built-in functions (Builtin_XXX pattern) ----------
         if name.startswith("Builtin_"):
             fname = name[8:].upper()  # Strip "Builtin_" prefix
-            
+
             # Get arguments - may be in 'arg' (list or single) or 'args'
             raw_args = getattr(expr, "arg", None) or getattr(expr, "args", [])
             if not isinstance(raw_args, list):
@@ -521,8 +575,16 @@ class AlgebraTranslator:
                 # SPARQL SUBSTR has special argument structure: arg, start, length
                 # The arg is in args[0], but start/length are separate attributes
                 string_arg = args[0] if args else self._translate_expr(expr.arg, ctx)
-                start = self._translate_expr(expr.start, ctx) if hasattr(expr, 'start') else None
-                length = self._translate_expr(expr.length, ctx) if hasattr(expr, 'length') and expr.length is not None else None
+                start = (
+                    self._translate_expr(expr.start, ctx)
+                    if hasattr(expr, "start")
+                    else None
+                )
+                length = (
+                    self._translate_expr(expr.length, ctx)
+                    if hasattr(expr, "length") and expr.length is not None
+                    else None
+                )
                 if length is not None:
                     return func.substr(string_arg, start, length)
                 elif start is not None:
@@ -549,13 +611,16 @@ class AlgebraTranslator:
                 return args[0]
 
             if fname == "STRSTARTS":
-                s, prefix = args
+                s = self._translate_expr(expr.arg1, ctx)
+                prefix = self._translate_expr(expr.arg2, ctx)
                 return s.like(prefix.concat(literal("%")))
             if fname == "STRENDS":
-                s, suffix = args
+                s = self._translate_expr(expr.arg1, ctx)
+                suffix = self._translate_expr(expr.arg2, ctx)
                 return s.like(literal("%").concat(suffix))
             if fname == "CONTAINS":
-                s, frag = args
+                s = self._translate_expr(expr.arg1, ctx)
+                frag = self._translate_expr(expr.arg2, ctx)
                 return s.like(literal("%").concat(frag).concat(literal("%")))
 
             # REGEX/REPLACE would be dialect-specific; stub:
@@ -590,7 +655,14 @@ class AlgebraTranslator:
                 return getattr(func, fname.lower())(*args)
 
             # --- RDF term helpers (schema-dependent) ---
-            if fname in ("LANG", "DATATYPE", "ISIRI", "ISBLANK", "ISLITERAL", "ISNUMERIC"):
+            if fname in (
+                "LANG",
+                "DATATYPE",
+                "ISIRI",
+                "ISBLANK",
+                "ISLITERAL",
+                "ISNUMERIC",
+            ):
                 raise NotImplementedError(f"{fname} requires schema-specific mapping")
 
             # Fallback: generic SQL function
@@ -599,7 +671,7 @@ class AlgebraTranslator:
         # ---------- Aggregates as expressions ----------
         if name == "Aggregate":
             agg_name = expr.AggFunc.upper()
-            agg_vars = getattr(expr, 'vars', None)
+            agg_vars = getattr(expr, "vars", None)
             if agg_vars:
                 arg = self._translate_expr(agg_vars[0], ctx)
             else:
@@ -625,7 +697,9 @@ class AlgebraTranslator:
                 elif self.engine.dialect.name in ["postgresql", "databricks"]:
                     f = func.string_agg
                 else:
-                    raise NotImplementedError(f"GROUP_CONCAT aggregate is not supported for dialect {self.engine.dialect.name}")
+                    raise NotImplementedError(
+                        f"GROUP_CONCAT aggregate is not supported for dialect {self.engine.dialect.name}"
+                    )
                 sep = getattr(expr, "separator", ",")
                 if distinct:
                     return f(arg.distinct(), sep)
@@ -636,7 +710,6 @@ class AlgebraTranslator:
             return f(arg.distinct() if distinct else arg)
 
         raise NotImplementedError(f"Expression kind {name!r} not handled by translator")
-
 
 
 # Example usage
@@ -656,12 +729,11 @@ if __name__ == "__main__":
     engine = create_databricks_engine(
         server_hostname="e2-demo-field-eng.cloud.databricks.com",
         http_path="/sql/1.0/warehouses/8baced1ff014912d",
-        access_token=""
+        access_token="",
     )
 
     translator = AlgebraTranslator(
-        engine=engine,
-        table_name="users.joshua_green.triples"
+        engine=engine, table_name="users.joshua_green.triples"
     )
 
     result = translator.execute(sparql_query)
