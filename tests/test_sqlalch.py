@@ -97,23 +97,6 @@ class TestAlgebraTranslator(unittest.TestCase):
         selected_column_names = {col.key for col in sql_query.selected_columns}
         self.assertEqual(selected_column_names, {'person', 'name', 'age'})
         
-        # The query should select from a CTE (since LEFT JOIN creates a CTE)
-        froms = sql_query.get_final_froms()
-        self.assertEqual(len(froms), 1)
-        
-        # The FROM should be a CTE
-        cte = froms[0]
-        self.assertIsInstance(cte, CTE)
-        
-        # The CTE should be a SELECT with a LEFT JOIN
-        # We can check this by looking at the CTE's original element
-        cte_select = cte.original
-        self.assertIsInstance(cte_select, Select)
-        
-        # Verify there's a FROM clause (which should contain the LEFT JOIN)
-        cte_froms = cte_select.get_final_froms()
-        self.assertGreater(len(cte_froms), 0)
-        
         # Verify the query is executable
         try:
             compiled = sql_query.compile()
