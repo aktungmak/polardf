@@ -17,6 +17,7 @@ import unittest
 import urllib.request
 import urllib.error
 from pathlib import Path
+from collections import Counter
 from typing import Dict, List, Optional, Tuple, Any
 
 from rdflib import Graph, Namespace, URIRef, Literal, BNode
@@ -524,18 +525,18 @@ def results_equivalent(
             f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}",
         )
 
-    # Normalize and compare as multisets
+    # Normalize and compare as multisets using Counter (avoids sorting mixed types)
     def normalize_row(row: Dict[str, Any], vars: List[str]) -> tuple:
         """Convert a row to a normalized tuple for comparison."""
         return tuple(normalize_value(row.get(v)) for v in sorted(vars))
 
-    actual_multiset = sorted([normalize_row(r, actual_vars) for r in actual_rows])
-    expected_multiset = sorted([normalize_row(r, expected_vars) for r in expected_rows])
+    actual_multiset = Counter(normalize_row(r, actual_vars) for r in actual_rows)
+    expected_multiset = Counter(normalize_row(r, expected_vars) for r in expected_rows)
 
     if actual_multiset != expected_multiset:
         return (
             False,
-            f"Row content mismatch:\nActual: {actual_multiset}\nExpected: {expected_multiset}",
+            f"Row content mismatch:\nActual: {dict(actual_multiset)}\nExpected: {dict(expected_multiset)}",
         )
 
     return True, ""
