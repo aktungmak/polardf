@@ -12,6 +12,7 @@ and filter for SELECT queries since that's what's currently implemented.
 """
 
 import os
+import ssl
 import unittest
 import urllib.request
 import urllib.error
@@ -71,7 +72,11 @@ def download_file(url: str, force: bool = False) -> str:
         return str(local_path)
 
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(url, timeout=30, context=ssl_context) as response:
             content = response.read()
             local_path.write_bytes(content)
         return str(local_path)
