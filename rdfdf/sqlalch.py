@@ -1,4 +1,5 @@
 import itertools
+import warnings
 from typing import List, Optional, Union
 
 from rdflib import Literal, URIRef
@@ -31,15 +32,41 @@ from sqlalchemy.sql import column
 
 
 def term_to_string(term) -> Optional[str]:
-    """Convert an RDF term (URIRef or Literal) to its string representation.
+    """Convert an RDF term (URIRef, Literal, or BNode) to its string representation.
 
-    Returns None if the term is not a URIRef or Literal (e.g., a Variable).
+    Returns None if the term is not a recognized RDF term type (e.g., a Variable).
+
+    The format matches how terms are stored in the database:
+    - URIRefs: the raw URI string
+    - Literals: the lexical value (type info is stored in the 'ot' column)
+    - BNodes: _:id
     """
     if isinstance(term, URIRef):
-        return f"<{term}>"
+        return str(term)
     elif isinstance(term, Literal):
         return str(term)
+    elif hasattr(term, "__class__") and term.__class__.__name__ == "BNode":
+        return f"_:{term}"
     return None
+
+
+def term_to_object_type(term) -> Optional[str]:
+    """Get the object type for the 'ot' column.
+
+    Returns:
+    - None for URIRef and BNode (IRI/blank node)
+    - Datatype URI string for typed literals
+    - Empty string "" for plain literals (no datatype, no language)
+    """
+    if isinstance(term, Literal):
+        if term.datatype:
+            return str(term.datatype)
+        elif term.language:
+            return f"@{term.language}"
+        else:
+            # TODO should we set a default value for plain literals?
+            return ""  # Plain literal or BNode
+    return None  # URIRef, BNode, or unknown
 
 
 def create_databricks_engine(
@@ -70,6 +97,7 @@ class AlgebraTranslator:
             Column("s", String, nullable=False, primary_key=True),
             Column("p", String, nullable=False, primary_key=True),
             Column("o", String, nullable=False, primary_key=True),
+            Column("ot", String, nullable=True, primary_key=True),
         )
 
         # TODO create a symbol table alterantive like this
@@ -207,6 +235,14 @@ class AlgebraTranslator:
                 columns.append(self.table.c.o.label(str(o)))
         elif (o_str := term_to_string(o)) is not None:
             conditions.append(self.table.c.o == o_str)
+            # Also filter by object type
+            o_type = term_to_object_type(o)
+            if o_type is None:
+                # URIRef or BNode - ot should be NULL
+                conditions.append(self.table.c.ot.is_(None))
+            else:
+                # Literal - ot should match the type
+                conditions.append(self.table.c.ot == o_type)
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
 
@@ -231,9 +267,10 @@ class AlgebraTranslator:
         # Convert bound values to strings for comparison
         s_value = term_to_string(s)
         o_value = term_to_string(o)
+        o_type = term_to_object_type(o) if not isinstance(o, Variable) else None
 
-        # Base case: all direct edges with the predicate (only need s and o, not p)
-        base_query = select(self.table.c.s, self.table.c.o).where(
+        # Base case: all direct edges with the predicate (need s, o, and ot for type filtering)
+        base_query = select(self.table.c.s, self.table.c.o, self.table.c.ot).where(
             self.table.c.p == pred_value
         )
 
@@ -246,6 +283,7 @@ class AlgebraTranslator:
             select(
                 path_cte.c.s,  # Keep original starting node
                 self.table.c.o,  # Extend to new destinations
+                self.table.c.ot,  # Carry forward object type
             )
             .select_from(path_cte.join(self.table, path_cte.c.o == self.table.c.s))
             .where(self.table.c.p == pred_value)
@@ -273,6 +311,13 @@ class AlgebraTranslator:
             conditions.append(path_cte.c.s == s_value)
         if o_value is not None:
             conditions.append(path_cte.c.o == o_value)
+            # Also filter by object type
+            if o_type is None:
+                # URIRef or BNode - ot should be NULL
+                conditions.append(path_cte.c.ot.is_(None))
+            else:
+                # Literal - ot should match the type
+                conditions.append(path_cte.c.ot == o_type)
 
         if conditions:
             final_query = final_query.where(and_(*conditions))
@@ -467,13 +512,14 @@ class AlgebraTranslator:
                 return ctx[var_name]
             raise ValueError(f"Variable ?{var_name} not found in context")
 
-        # Base case: Literal - convert to SQL literal
-        if isinstance(expr, Literal):
+        # Base case: Literal or URIRef - convert to SQL literal string
+        if isinstance(expr, (Literal, URIRef)):
+            # Handle boolean literals specially for FILTER expressions
+            if isinstance(expr, Literal) and expr.datatype == URIRef(
+                "http://www.w3.org/2001/XMLSchema#boolean"
+            ):
+                return true() if expr.toPython() else not_(true())
             return literal(str(expr))
-
-        # Base case: URIRef - convert to SQL literal string
-        if isinstance(expr, URIRef):
-            return literal(f"<{expr}>")
 
         if not isinstance(expr, CompValue):
             # raw constant or already an expression
