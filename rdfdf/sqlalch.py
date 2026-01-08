@@ -1,6 +1,6 @@
 import itertools
 import warnings
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from rdflib import Literal, URIRef, XSD
 from rdflib.paths import Path, SequencePath, MulPath
@@ -78,6 +78,67 @@ def create_databricks_engine(
     return create_engine(engine_uri, **engine_kwargs)
 
 
+# Dispatch tables for expression translation
+_RELATIONAL_OPS = {
+    "=": lambda l, r: l == r,
+    "!=": lambda l, r: l != r,
+    "<": lambda l, r: l < r,
+    ">": lambda l, r: l > r,
+    "<=": lambda l, r: l <= r,
+    ">=": lambda l, r: l >= r,
+}
+
+_BINARY_OPS = {
+    "+": lambda a, b: a + b,
+    "-": lambda a, b: a - b,
+    "*": lambda a, b: a * b,
+    "/": lambda a, b: a / b,
+}
+
+# Built-in functions that take args and map directly to SQL functions
+_BUILTIN_SIMPLE = {
+    "STRLEN": func.length,
+    "UCASE": func.upper,
+    "LCASE": func.lower,
+    "ABS": func.abs,
+    "ROUND": func.round,
+    "CEIL": func.ceil,
+    "FLOOR": func.floor,
+    "MD5": func.md5,
+    "COALESCE": func.coalesce,
+}
+
+# Built-in functions that take no arguments
+_BUILTIN_NOARG = {
+    "RAND": func.random,
+    "NOW": func.current_timestamp,
+}
+
+# Hash functions (all map to lowercase SQL function names)
+_HASH_FUNCS = {"SHA1", "SHA256", "SHA384", "SHA512"}
+
+# Date/time extraction fields
+_DATETIME_FIELDS = {"YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS"}
+
+# Aggregate functions that map directly
+_AGG_FUNCS = {
+    "SUM": func.sum,
+    "AVG": func.avg,
+    "MIN": func.min,
+    "MAX": func.max,
+}
+
+# RDF term helpers that require schema-specific mapping
+_SCHEMA_DEPENDENT_FUNCS = {
+    "LANG",
+    "DATATYPE",
+    "ISIRI",
+    "ISBLANK",
+    "ISLITERAL",
+    "ISNUMERIC",
+}
+
+
 class AlgebraTranslator:
     """Translates SPARQL algebra expressions to SQLAlchemy queries.
     The assumption is that the triples are stored in a table with columns s, p, and o.
@@ -105,6 +166,39 @@ class AlgebraTranslator:
 
         if create_table:
             self.metadata.create_all(self.engine)
+
+    # ---------- Helper Methods ----------
+
+    def _add_object_type_condition(
+        self, conditions: list, ot_column, o_type: Optional[str]
+    ):
+        """Add object type filtering condition to the conditions list."""
+        if o_type is None:
+            conditions.append(ot_column.is_(None))
+        else:
+            conditions.append(ot_column == o_type)
+
+    def _ensure_subquery(self, query):
+        """Convert query to a subquery/CTE for column access."""
+        return query if isinstance(query, CTE) else query.subquery()
+
+    def _get_column_context(self, query) -> Dict[str, Column]:
+        """Build a variable->column mapping from query."""
+        if isinstance(query, CTE):
+            return {name: query.c[name] for name in query.c.keys()}
+        elif hasattr(query, "selected_columns"):
+            return {col.key: col for col in query.selected_columns}
+        return {}
+
+    def _get_column_names(self, query) -> set:
+        """Get the set of column names from a query."""
+        if isinstance(query, CTE):
+            return set(query.c.keys())
+        elif hasattr(query, "selected_columns"):
+            return set(col.key for col in query.selected_columns)
+        return set()
+
+    # ---------- Core Translation Methods ----------
 
     def execute(self, sparql_query: str) -> CursorResult:
         """Translate a SPARQL query and execute it."""
@@ -235,14 +329,8 @@ class AlgebraTranslator:
                 columns.append(self.table.c.o.label(str(o)))
         elif (o_str := term_to_string(o)) is not None:
             conditions.append(self.table.c.o == o_str)
-            # Also filter by object type
             o_type = term_to_object_type(o)
-            if o_type is None:
-                # URIRef or BNode - ot should be NULL
-                conditions.append(self.table.c.ot.is_(None))
-            else:
-                # Literal - ot should match the type
-                conditions.append(self.table.c.ot == o_type)
+            self._add_object_type_condition(conditions, self.table.c.ot, o_type)
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
 
@@ -316,13 +404,7 @@ class AlgebraTranslator:
             conditions.append(path_cte.c.s == s_value)
         if o_value is not None:
             conditions.append(path_cte.c.o == o_value)
-            # Also filter by object type
-            if o_type is None:
-                # URIRef or BNode - ot should be NULL
-                conditions.append(path_cte.c.ot.is_(None))
-            else:
-                # Literal - ot should match the type
-                conditions.append(path_cte.c.ot == o_type)
+            self._add_object_type_condition(conditions, path_cte.c.ot, o_type)
 
         if conditions:
             final_query = final_query.where(and_(*conditions))
@@ -361,15 +443,7 @@ class AlgebraTranslator:
 
         # Translate the inner pattern
         base_query = self._translate_pattern(pattern)
-
-        # Get column names from base query
-        if isinstance(base_query, CTE):
-            base_cols = set(base_query.c.keys())
-        elif hasattr(base_query, "selected_columns"):
-            base_cols = set(col.key for col in base_query.selected_columns)
-        else:
-            base_cols = set()
-
+        base_cols = self._get_column_names(base_query)
         project_var_names = set(str(var) for var in project_vars)
 
         if base_cols == project_var_names:
@@ -419,15 +493,8 @@ class AlgebraTranslator:
 
         # Translate the inner pattern
         inner_query = self._translate_pattern(inner_pattern)
-
-        # Convert to subquery so we can add columns
-        if isinstance(inner_query, CTE):
-            subquery = inner_query
-        else:
-            subquery = inner_query.subquery()
-
-        # Build a context mapping variable names to columns from the subquery
-        ctx = {name: subquery.c[name] for name in subquery.c.keys()}
+        subquery = self._ensure_subquery(inner_query)
+        ctx = self._get_column_context(subquery)
 
         # Translate the expression
         sql_expr = self._translate_expr(expr, ctx)
@@ -451,11 +518,10 @@ class AlgebraTranslator:
 
         # Build context from available columns
         if isinstance(inner_query, CTE):
-            ctx = {name: inner_query.c[name] for name in inner_query.c.keys()}
+            ctx = self._get_column_context(inner_query)
             base_select = select(*inner_query.c).select_from(inner_query)
         else:
-            # It's a Select - get columns and add WHERE directly
-            ctx = {col.key: col for col in inner_query.selected_columns}
+            ctx = self._get_column_context(inner_query)
             base_select = inner_query
 
         # Translate the filter expression
@@ -502,6 +568,8 @@ class AlgebraTranslator:
                 left_cte.outerjoin(right_cte, true())
             )
 
+    # ---------- Expression Translation ----------
+
     def _translate_expr(self, expr, ctx):
         """Translate an rdflib SPARQL algebra expression (CompValue / term)
         into a SQLAlchemy expression.
@@ -532,243 +600,201 @@ class AlgebraTranslator:
 
         name = expr.name
 
-        # ---------- Logical & comparison ----------
+        # Dispatch to specific handlers
         if name == "RelationalExpression":
-            left = self._translate_expr(expr.expr, ctx)
-            right = self._translate_expr(expr.other, ctx)
-            op = expr.op
-            if op == "=":
-                return left == right
-            if op == "!=":
-                return left != right
-            if op == "<":
-                return left < right
-            if op == ">":
-                return left > right
-            if op == "<=":
-                return left <= right
-            if op == ">=":
-                return left >= right
-            raise NotImplementedError(f"Relational op {op!r} not supported")
-
+            return self._translate_relational(expr, ctx)
         if name == "ConditionalAndExpression":
-            operands = [self._translate_expr(expr.expr, ctx)]
-            operands.extend(self._translate_expr(e, ctx) for e in expr.other)
-            return and_(*operands)
+            return self._translate_conditional_and(expr, ctx)
         if name == "ConditionalOrExpression":
-            operands = [self._translate_expr(expr.expr, ctx)]
-            operands.extend(self._translate_expr(e, ctx) for e in expr.other)
-            return or_(*operands)
+            return self._translate_conditional_or(expr, ctx)
         if name == "UnaryNot":
             return not_(self._translate_expr(expr.expr, ctx))
-
-        # ---------- Arithmetic ----------
-        if name == "AdditiveExpression":
-            base = self._translate_expr(expr.expr, ctx)
-            ops = expr.op if hasattr(expr, "op") else []
-            others = expr.other if hasattr(expr, "other") else []
-            for op, other in zip(ops, others):
-                rhs = self._translate_expr(other, ctx)
-                if op == "+":
-                    base = base + rhs
-                elif op == "-":
-                    base = base - rhs
-                else:
-                    raise NotImplementedError(f"Additive op {op!r} not supported")
-            return base
-
-        if name == "MultiplicativeExpression":
-            base = self._translate_expr(expr.expr, ctx)
-            ops = expr.op if hasattr(expr, "op") else []
-            others = expr.other if hasattr(expr, "other") else []
-            for op, other in zip(ops, others):
-                rhs = self._translate_expr(other, ctx)
-                if op == "*":
-                    base = base * rhs
-                elif op == "/":
-                    base = base / rhs
-                else:
-                    raise NotImplementedError(f"Multiplicative op {op!r} not supported")
-            return base
-
-        # ---------- IN / NOT IN ----------
+        if name in ("AdditiveExpression", "MultiplicativeExpression"):
+            return self._translate_binary_chain(expr, ctx)
         if name == "InExpression":
-            lhs = self._translate_expr(expr.expr, ctx)
-            items = [self._translate_expr(v, ctx) for v in expr.other]
-            return lhs.not_in(items) if expr.notin else lhs.in_(items)
-
-        # ---------- Built-in functions (Builtin_XXX pattern) ----------
+            return self._translate_in_expression(expr, ctx)
         if name.startswith("Builtin_"):
-            fname = name[8:].upper()  # Strip "Builtin_" prefix
-
-            # Get arguments - may be in 'arg' (list or single) or 'args'
-            raw_args = getattr(expr, "arg", None) or getattr(expr, "args", [])
-            if not isinstance(raw_args, list):
-                raw_args = [raw_args]
-            args = [self._translate_expr(a, ctx) for a in raw_args]
-
-            # --- Conditional forms ---
-            if fname == "IF":
-                cond = args[0]
-                then = args[1]
-                els = args[2]
-                return case((cond, then), else_=els)
-            if fname == "COALESCE":
-                return func.coalesce(*args)
-            if fname == "BOUND":
-                # BOUND(?var) tests if variable is not NULL
-                return args[0].isnot(None)
-
-            # --- String functions ---
-            if fname == "STRLEN":
-                return func.length(*args)
-            if fname == "SUBSTR":
-                # SPARQL SUBSTR has special argument structure: arg, start, length
-                # The arg is in args[0], but start/length are separate attributes
-                string_arg = args[0] if args else self._translate_expr(expr.arg, ctx)
-                start = (
-                    self._translate_expr(expr.start, ctx)
-                    if hasattr(expr, "start")
-                    else None
-                )
-                length = (
-                    self._translate_expr(expr.length, ctx)
-                    if hasattr(expr, "length") and expr.length is not None
-                    else None
-                )
-                if length is not None:
-                    return func.substr(string_arg, start, length)
-                elif start is not None:
-                    return func.substr(string_arg, start)
-                return func.substr(string_arg)
-            if fname == "UCASE":
-                return func.upper(*args)
-            if fname == "LCASE":
-                return func.lower(*args)
-            if fname == "CONCAT":
-                # SQLite uses || for concat, but func.concat works for most DBs
-                # For broader compatibility, we can use explicit concatenation
-                if len(args) == 0:
-                    return literal("")
-                if len(args) == 1:
-                    return args[0]
-                # Chain concatenation with ||
-                result = args[0]
-                for arg in args[1:]:
-                    result = result.concat(arg)
-                return result
-            if fname == "STR":
-                # STR just returns the lexical form - identity for string storage
-                return args[0]
-
-            if fname == "STRSTARTS":
-                s = self._translate_expr(expr.arg1, ctx)
-                prefix = self._translate_expr(expr.arg2, ctx)
-                return s.like(prefix.concat(literal("%")))
-            if fname == "STRENDS":
-                s = self._translate_expr(expr.arg1, ctx)
-                suffix = self._translate_expr(expr.arg2, ctx)
-                return s.like(literal("%").concat(suffix))
-            if fname == "CONTAINS":
-                s = self._translate_expr(expr.arg1, ctx)
-                frag = self._translate_expr(expr.arg2, ctx)
-                return s.like(literal("%").concat(frag).concat(literal("%")))
-
-            # REGEX/REPLACE would be dialect-specific; stub:
-            if fname == "REGEX":
-                raise NotImplementedError("REGEX mapping is dialect-specific")
-            if fname == "REPLACE":
-                raise NotImplementedError("REPLACE mapping is dialect-specific")
-
-            # --- Numeric ---
-            if fname == "ABS":
-                return func.abs(*args)
-            if fname == "ROUND":
-                return func.round(*args)
-            if fname == "CEIL":
-                return func.ceil(*args)
-            if fname == "FLOOR":
-                return func.floor(*args)
-            if fname == "RAND":
-                return func.random()  # adjust to func.rand() if needed
-
-            # --- Date/time ---
-            if fname == "NOW":
-                return func.current_timestamp()
-            if fname in ("YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS"):
-                field = fname.lower()
-                return func.extract(field, *args)
-
-            # --- Hashes ---
-            if fname == "MD5":
-                return func.md5(*args)
-            if fname in ("SHA1", "SHA256", "SHA384", "SHA512"):
-                return getattr(func, fname.lower())(*args)
-
-            # --- RDF term comparison ---
-            if fname == "SAMETERM":
-                # sameTerm(?a, ?b) tests if two RDF terms are identical
-                arg1 = self._translate_expr(expr.arg1, ctx)
-                arg2 = self._translate_expr(expr.arg2, ctx)
-                return arg1 == arg2
-
-            # --- RDF term helpers (schema-dependent) ---
-            if fname in (
-                "LANG",
-                "DATATYPE",
-                "ISIRI",
-                "ISBLANK",
-                "ISLITERAL",
-                "ISNUMERIC",
-            ):
-                raise NotImplementedError(f"{fname} requires schema-specific mapping")
-
-            raise NotImplementedError(
-                f"SPARQL built-in function {fname} is not supported"
-            )
-
-        # ---------- Aggregates as expressions ----------
+            return self._translate_builtin(expr, ctx)
         if name == "Aggregate":
-            agg_name = expr.AggFunc.upper()
-            agg_vars = getattr(expr, "vars", None)
-            if agg_vars:
-                arg = self._translate_expr(agg_vars[0], ctx)
-            else:
-                arg = literal(1)  # COUNT(*) case
-            distinct = getattr(expr, "distinct", False)
-
-            if agg_name == "COUNT":
-                return func.count(arg.distinct()) if distinct else func.count(arg)
-            if agg_name == "SUM":
-                f = func.sum
-            elif agg_name == "AVG":
-                f = func.avg
-            elif agg_name == "MIN":
-                f = func.min
-            elif agg_name == "MAX":
-                f = func.max
-            elif agg_name == "SAMPLE":
-                warnings.warn("SAMPLE aggregate is not supported, falling back to MIN")
-                f = func.min
-            elif agg_name == "GROUP_CONCAT":
-                if self.engine.dialect.name == "sqlite":
-                    f = func.group_concat
-                elif self.engine.dialect.name in ["postgresql", "databricks"]:
-                    f = func.string_agg
-                else:
-                    raise NotImplementedError(
-                        f"GROUP_CONCAT aggregate is not supported for dialect {self.engine.dialect.name}"
-                    )
-                sep = getattr(expr, "separator", ",")
-                if distinct:
-                    return f(arg.distinct(), sep)
-                return f(arg, sep)
-            else:
-                raise NotImplementedError(f"Aggregate {agg_name!r} not supported")
-
-            return f(arg.distinct() if distinct else arg)
+            return self._translate_aggregate(expr, ctx)
 
         raise NotImplementedError(f"Expression kind {name!r} not handled by translator")
+
+    def _translate_relational(self, expr, ctx):
+        """Translate a RelationalExpression (=, !=, <, >, <=, >=)."""
+        left = self._translate_expr(expr.expr, ctx)
+        right = self._translate_expr(expr.other, ctx)
+        op = expr.op
+        if op in _RELATIONAL_OPS:
+            return _RELATIONAL_OPS[op](left, right)
+        raise NotImplementedError(f"Relational op {op!r} not supported")
+
+    def _translate_conditional_and(self, expr, ctx):
+        """Translate a ConditionalAndExpression (&&)."""
+        operands = [self._translate_expr(expr.expr, ctx)]
+        operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+        return and_(*operands)
+
+    def _translate_conditional_or(self, expr, ctx):
+        """Translate a ConditionalOrExpression (||)."""
+        operands = [self._translate_expr(expr.expr, ctx)]
+        operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+        return or_(*operands)
+
+    def _translate_binary_chain(self, expr, ctx):
+        """Translate chained binary expressions (+/-, *//)."""
+        base = self._translate_expr(expr.expr, ctx)
+        ops = getattr(expr, "op", [])
+        others = getattr(expr, "other", [])
+        for op, other in zip(ops, others):
+            rhs = self._translate_expr(other, ctx)
+            if op not in _BINARY_OPS:
+                raise NotImplementedError(f"Binary op {op!r} not supported")
+            base = _BINARY_OPS[op](base, rhs)
+        return base
+
+    def _translate_in_expression(self, expr, ctx):
+        """Translate IN / NOT IN expressions."""
+        lhs = self._translate_expr(expr.expr, ctx)
+        items = [self._translate_expr(v, ctx) for v in expr.other]
+        return lhs.not_in(items) if expr.notin else lhs.in_(items)
+
+    def _translate_builtin(self, expr, ctx):
+        """Translate SPARQL built-in functions (Builtin_XXX)."""
+        fname = expr.name[8:].upper()  # Strip "Builtin_" prefix
+
+        # Get arguments - may be in 'arg' (list or single) or 'args'
+        raw_args = getattr(expr, "arg", None) or getattr(expr, "args", [])
+        if not isinstance(raw_args, list):
+            raw_args = [raw_args]
+        args = [self._translate_expr(a, ctx) for a in raw_args]
+
+        # --- Simple dispatch functions ---
+        if fname in _BUILTIN_SIMPLE:
+            return _BUILTIN_SIMPLE[fname](*args)
+
+        # --- No-arg functions ---
+        if fname in _BUILTIN_NOARG:
+            return _BUILTIN_NOARG[fname]()
+
+        # --- Conditional forms ---
+        if fname == "IF":
+            return case((args[0], args[1]), else_=args[2])
+        if fname == "BOUND":
+            return args[0].isnot(None)
+
+        # --- String functions with special handling ---
+        if fname == "SUBSTR":
+            return self._translate_substr(expr, args, ctx)
+        if fname == "CONCAT":
+            return self._translate_concat(args)
+        if fname == "STR":
+            return args[0]
+        if fname == "STRSTARTS":
+            s = self._translate_expr(expr.arg1, ctx)
+            prefix = self._translate_expr(expr.arg2, ctx)
+            return s.like(prefix.concat(literal("%")))
+        if fname == "STRENDS":
+            s = self._translate_expr(expr.arg1, ctx)
+            suffix = self._translate_expr(expr.arg2, ctx)
+            return s.like(literal("%").concat(suffix))
+        if fname == "CONTAINS":
+            s = self._translate_expr(expr.arg1, ctx)
+            frag = self._translate_expr(expr.arg2, ctx)
+            return s.like(literal("%").concat(frag).concat(literal("%")))
+
+        # --- Dialect-specific (stubs) ---
+        if fname in ("REGEX", "REPLACE"):
+            raise NotImplementedError(f"{fname} mapping is dialect-specific")
+
+        # --- Date/time extraction ---
+        if fname in _DATETIME_FIELDS:
+            return func.extract(fname.lower(), *args)
+
+        # --- Hash functions ---
+        if fname in _HASH_FUNCS:
+            return getattr(func, fname.lower())(*args)
+
+        # --- RDF term comparison ---
+        if fname == "SAMETERM":
+            arg1 = self._translate_expr(expr.arg1, ctx)
+            arg2 = self._translate_expr(expr.arg2, ctx)
+            return arg1 == arg2
+
+        # --- Schema-dependent functions ---
+        if fname in _SCHEMA_DEPENDENT_FUNCS:
+            raise NotImplementedError(f"{fname} requires schema-specific mapping")
+
+        raise NotImplementedError(f"SPARQL built-in function {fname} is not supported")
+
+    def _translate_substr(self, expr, args, ctx):
+        """Translate SUBSTR with its special argument structure."""
+        string_arg = args[0] if args else self._translate_expr(expr.arg, ctx)
+        start = (
+            self._translate_expr(expr.start, ctx) if hasattr(expr, "start") else None
+        )
+        length = (
+            self._translate_expr(expr.length, ctx)
+            if hasattr(expr, "length") and expr.length is not None
+            else None
+        )
+        if length is not None:
+            return func.substr(string_arg, start, length)
+        elif start is not None:
+            return func.substr(string_arg, start)
+        return func.substr(string_arg)
+
+    def _translate_concat(self, args):
+        """Translate CONCAT with chained concatenation."""
+        if len(args) == 0:
+            return literal("")
+        if len(args) == 1:
+            return args[0]
+        result = args[0]
+        for arg in args[1:]:
+            result = result.concat(arg)
+        return result
+
+    def _translate_aggregate(self, expr, ctx):
+        """Translate aggregate expressions (COUNT, SUM, AVG, etc.)."""
+        agg_name = expr.AggFunc.upper()
+        agg_vars = getattr(expr, "vars", None)
+        arg = self._translate_expr(agg_vars[0], ctx) if agg_vars else literal(1)
+        distinct = getattr(expr, "distinct", False)
+
+        # COUNT has special handling for distinct
+        if agg_name == "COUNT":
+            return func.count(arg.distinct()) if distinct else func.count(arg)
+
+        # Simple aggregate functions
+        if agg_name in _AGG_FUNCS:
+            f = _AGG_FUNCS[agg_name]
+            return f(arg.distinct() if distinct else arg)
+
+        # SAMPLE falls back to MIN with warning
+        if agg_name == "SAMPLE":
+            warnings.warn("SAMPLE aggregate is not supported, falling back to MIN")
+            return func.min(arg.distinct() if distinct else arg)
+
+        # GROUP_CONCAT is dialect-specific
+        if agg_name == "GROUP_CONCAT":
+            return self._translate_group_concat(arg, expr, distinct)
+
+        raise NotImplementedError(f"Aggregate {agg_name!r} not supported")
+
+    def _translate_group_concat(self, arg, expr, distinct):
+        """Translate GROUP_CONCAT with dialect-specific handling."""
+        dialect = self.engine.dialect.name
+        if dialect == "sqlite":
+            f = func.group_concat
+        elif dialect in ("postgresql", "databricks"):
+            f = func.string_agg
+        else:
+            raise NotImplementedError(
+                f"GROUP_CONCAT aggregate is not supported for dialect {dialect}"
+            )
+        sep = getattr(expr, "separator", ",")
+        return f(arg.distinct(), sep) if distinct else f(arg, sep)
 
 
 # Example usage
