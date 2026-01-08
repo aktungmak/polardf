@@ -103,6 +103,87 @@ class TestAlgebraTranslator(unittest.TestCase):
         except Exception as e:
             self.fail(f"Query compilation failed: {e}")
 
+    def test_translate_order_by_asc(self):
+        """Test translation of ORDER BY with ascending order."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?o
+        WHERE { ?s ex:p ?o }
+        ORDER BY ?o
+        """
+
+        sql_query = self.translator.translate(sparql_query)
+
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+
+        # Check that ORDER BY clause exists
+        self.assertIsNotNone(sql_query._order_by_clauses)
+        self.assertEqual(len(sql_query._order_by_clauses), 1)
+
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+            # Check that ORDER BY appears in the compiled SQL
+            sql_str = str(compiled)
+            self.assertIn("ORDER BY", sql_str)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_translate_order_by_desc(self):
+        """Test translation of ORDER BY with descending order."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?o
+        WHERE { ?s ex:p ?o }
+        ORDER BY DESC(?o)
+        """
+
+        sql_query = self.translator.translate(sparql_query)
+
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+
+        # Check that ORDER BY clause exists
+        self.assertIsNotNone(sql_query._order_by_clauses)
+        self.assertEqual(len(sql_query._order_by_clauses), 1)
+
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+            # Check that ORDER BY DESC appears in the compiled SQL
+            sql_str = str(compiled)
+            self.assertIn("ORDER BY", sql_str)
+            self.assertIn("DESC", sql_str)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
+    def test_translate_order_by_multiple(self):
+        """Test translation of ORDER BY with multiple sort keys."""
+        sparql_query = """
+        SELECT ?s ?p ?o
+        WHERE { ?s ?p ?o }
+        ORDER BY ?s DESC(?o)
+        """
+
+        sql_query = self.translator.translate(sparql_query)
+
+        # Verify it's a Select statement
+        self.assertIsInstance(sql_query, Select)
+
+        # Check that ORDER BY clause has two elements
+        self.assertIsNotNone(sql_query._order_by_clauses)
+        self.assertEqual(len(sql_query._order_by_clauses), 2)
+
+        # Verify the query is executable
+        try:
+            compiled = sql_query.compile()
+            self.assertIsNotNone(compiled)
+        except Exception as e:
+            self.fail(f"Query compilation failed: {e}")
+
 
 class TestAlgebraTranslatorExecute(unittest.TestCase):
     """Tests for executing queries against sample data."""
@@ -387,6 +468,88 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
         self.assertEqual(
             len(persons), len(set(persons)), "DISTINCT should eliminate duplicates"
         )
+
+    def test_execute_order_by_asc(self):
+        """Test ORDER BY ascending returns results in correct order."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?person ex:name ?name }
+        ORDER BY ?name
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        names = [row.name for row in rows]
+
+        # Should be sorted alphabetically: Alice, Bob, Charlie
+        self.assertEqual(names, ["Alice", "Bob", "Charlie"])
+
+    def test_execute_order_by_desc(self):
+        """Test ORDER BY descending returns results in correct order."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?person ex:name ?name }
+        ORDER BY DESC(?name)
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        names = [row.name for row in rows]
+
+        # Should be sorted reverse alphabetically: Charlie, Bob, Alice
+        self.assertEqual(names, ["Charlie", "Bob", "Alice"])
+
+    def test_execute_order_by_multiple(self):
+        """Test ORDER BY with multiple sort keys."""
+        # Insert additional data with duplicate predicates for sorting test
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    {
+                        "s": "http://example.org/alice",
+                        "p": "http://example.org/score",
+                        "o": "100",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://example.org/bob",
+                        "p": "http://example.org/score",
+                        "o": "100",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://example.org/charlie",
+                        "p": "http://example.org/score",
+                        "o": "50",
+                        "ot": str(XSD.string),
+                    },
+                ],
+            )
+            conn.commit()
+
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?person ?score
+        WHERE { ?person ex:score ?score }
+        ORDER BY ?score ?person
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+
+        # Should be sorted by score first, then by person
+        # score=100: alice, bob (alphabetically)
+        # score=50: charlie
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0].score, "100")
+        self.assertEqual(rows[0].person, "http://example.org/alice")
+        self.assertEqual(rows[1].score, "100")
+        self.assertEqual(rows[1].person, "http://example.org/bob")
+        self.assertEqual(rows[2].score, "50")
+        self.assertEqual(rows[2].person, "http://example.org/charlie")
 
 
 class TestAlgebraTranslatorMulPath(unittest.TestCase):

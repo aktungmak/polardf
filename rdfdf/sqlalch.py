@@ -27,6 +27,8 @@ from sqlalchemy import (
     func,
     or_,
     not_,
+    asc,
+    desc,
 )
 from sqlalchemy.sql import column
 
@@ -243,6 +245,8 @@ class AlgebraTranslator:
                 return self._translate_extend(pattern)
             elif pattern.name == "Filter":
                 return self._translate_filter(pattern)
+            elif pattern.name == "OrderBy":
+                return self._translate_order_by(pattern)
             else:
                 raise NotImplementedError(
                     f"Pattern type {pattern.name} not implemented"
@@ -529,6 +533,42 @@ class AlgebraTranslator:
 
         # Add WHERE clause directly (no extra subquery)
         return base_select.where(sql_condition)
+
+    def _translate_order_by(self, order_by):
+        """Translate an OrderBy operation.
+
+        OrderBy applies ordering to results from the inner pattern.
+        Structure: OrderBy(p=inner_pattern, expr=list_of_order_conditions)
+        """
+        inner_pattern = order_by["p"]
+        order_conditions = order_by["expr"]
+
+        # Translate the inner pattern
+        inner_query = self._translate_pattern(inner_pattern)
+
+        # Build context for expression translation
+        if isinstance(inner_query, CTE):
+            ctx = self._get_column_context(inner_query)
+            base_select = select(*inner_query.c).select_from(inner_query)
+        else:
+            ctx = self._get_column_context(inner_query)
+            base_select = inner_query
+
+        # Build ORDER BY clauses
+        order_clauses = []
+        for cond in order_conditions:
+            if isinstance(cond, CompValue) and cond.name == "OrderCondition":
+                sql_expr = self._translate_expr(cond.expr, ctx)
+                if cond.order == "DESC":
+                    order_clauses.append(desc(sql_expr))
+                else:
+                    order_clauses.append(asc(sql_expr))
+            else:
+                # Just a variable or expression (default ASC)
+                sql_expr = self._translate_expr(cond, ctx)
+                order_clauses.append(asc(sql_expr))
+
+        return base_select.order_by(*order_clauses)
 
     def _translate_left_join(self, left_join):
         """Translate a LeftJoin (OPTIONAL) operation."""
