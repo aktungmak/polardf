@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import Mock, patch, MagicMock
+from rdflib import XSD
 from sqlalchemy import create_engine, Engine
 from sqlalchemy.sql.selectable import Select, Subquery, CTE
 from rdfdf.sqlalch import AlgebraTranslator, create_databricks_engine
@@ -142,7 +143,6 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
             # alice has name "Alice"
             # bob has name "Bob" and age "30"
             # charlie has name "Charlie" (no age)
-            # ot="" (empty string) means the object is a plain literal
             conn.execute(
                 self.translator.table.insert(),
                 [
@@ -150,25 +150,25 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
                         "s": "http://example.org/alice",
                         "p": "http://example.org/name",
                         "o": "Alice",
-                        "ot": "",
+                        "ot": str(XSD.string),
                     },
                     {
                         "s": "http://example.org/bob",
                         "p": "http://example.org/name",
                         "o": "Bob",
-                        "ot": "",
+                        "ot": str(XSD.string),
                     },
                     {
                         "s": "http://example.org/bob",
                         "p": "http://example.org/age",
                         "o": "30",
-                        "ot": "",
+                        "ot": str(XSD.string),
                     },
                     {
                         "s": "http://example.org/charlie",
                         "p": "http://example.org/name",
                         "o": "Charlie",
-                        "ot": "",
+                        "ot": str(XSD.string),
                     },
                 ],
             )

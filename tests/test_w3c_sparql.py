@@ -24,7 +24,7 @@ from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
 from sqlalchemy import create_engine
 
-from rdfdf.sqlalch import AlgebraTranslator, term_to_string
+from rdfdf.sqlalch import AlgebraTranslator, term_to_string, term_to_object_type
 
 
 # W3C Test Suite namespaces
@@ -468,10 +468,16 @@ class SparqlResultParser:
                 return cls.parse_ttl_results(filepath)
 
 
-def normalize_value(value: Any) -> Any:
-    """Normalize a value for comparison.
+# TODO: This is a hack to normalise values for comparison.
+def normalise_value(value: Any) -> Any:
+    """Normalise a value for comparison.
 
-    Handles differences in formatting between expected and actual results.
+    Converts SPARQL result format to our raw database format:
+    - URIs: <http://...> -> http://...
+    - Typed literals: "value"^^<datatype> -> value
+    - Language-tagged: "value"@lang -> value
+    - Plain literals: "value" or value -> value
+    - BNodes: _:id -> _:id (unchanged)
     """
     if value is None:
         return None
@@ -481,16 +487,36 @@ def normalize_value(value: Any) -> Any:
     # Remove surrounding whitespace
     s = s.strip()
 
-    # Normalize integer representations
-    # e.g., "1"^^xsd:integer and "01"^^xsd:integer should match
-    if "^^" in s and "integer" in s.lower():
-        try:
-            # Extract the value part
-            val_part = s.split("^^")[0].strip('"')
-            return int(val_part)
-        except ValueError:
-            pass
+    # Handle BNodes - keep as-is
+    if s.startswith("_:"):
+        return s
 
+    # Handle URIs - strip angle brackets
+    # Expected results have <http://...>, our storage has http://...
+    if s.startswith("<") and s.endswith(">") and "://" in s and "^^" not in s:
+        return s[1:-1]
+
+    # Handle typed literals: "value"^^<datatype>
+    if "^^" in s:
+        # Extract the lexical value (between quotes before ^^)
+        val_part = s.split("^^")[0]
+        if val_part.startswith('"') and val_part.endswith('"'):
+            return val_part[1:-1]
+        return val_part
+
+    # Handle language-tagged literals: "value"@lang
+    if "@" in s and s.count('"') >= 2:
+        # Find the value between quotes
+        first_quote = s.index('"')
+        last_quote = s.rindex('"')
+        if first_quote < last_quote:
+            return s[first_quote + 1 : last_quote]
+
+    # Handle plain quoted literals: "value"
+    if s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+
+    # Plain unquoted value - return as-is
     return s
 
 
@@ -525,13 +551,13 @@ def results_equivalent(
             f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}",
         )
 
-    # Normalize and compare as multisets using Counter (avoids sorting mixed types)
-    def normalize_row(row: Dict[str, Any], vars: List[str]) -> tuple:
-        """Convert a row to a normalized tuple for comparison."""
-        return tuple(normalize_value(row.get(v)) for v in sorted(vars))
+    # Normalise and compare as multisets using Counter (avoids sorting mixed types)
+    def normalise_row(row: Dict[str, Any], vars: List[str]) -> tuple:
+        """Convert a row to a normalised tuple for comparison."""
+        return tuple(normalise_value(row.get(v)) for v in sorted(vars))
 
-    actual_multiset = Counter(normalize_row(r, actual_vars) for r in actual_rows)
-    expected_multiset = Counter(normalize_row(r, expected_vars) for r in expected_rows)
+    actual_multiset = Counter(normalise_row(r, actual_vars) for r in actual_rows)
+    expected_multiset = Counter(normalise_row(r, expected_vars) for r in expected_rows)
 
     if actual_multiset != expected_multiset:
         return (
@@ -660,28 +686,24 @@ class W3CSparqlTestBase(unittest.TestCase):
             self._load_graph_to_db(g)
 
     def _load_graph_to_db(self, g: Graph):
-        """Load an rdflib Graph into the database."""
+        """Load an rdflib Graph into the database.
+
+        Storage format matches the AlgebraTranslator's expectations:
+        - URIs: stored as raw URI strings (no angle brackets)
+        - Literals: lexical value in 'o', type info in 'ot'
+        - BNodes: _:id format
+        """
         triples = []
         for s, p, o in g:
+            # Subjects and predicates: use term_to_string (raw URI for URIRef)
             s_str = term_to_string(s) or str(s)
             p_str = term_to_string(p) or str(p)
 
-            if isinstance(o, URIRef):
-                o_str = f"<{o}>"
-            elif isinstance(o, Literal):
-                # Format literals according to our storage format
-                if o.datatype:
-                    o_str = f'"{o}"^^<{o.datatype}>'
-                elif o.language:
-                    o_str = f'"{o}"@{o.language}'
-                else:
-                    o_str = str(o)
-            elif isinstance(o, BNode):
-                o_str = f"_:{o}"
-            else:
-                o_str = str(o)
+            # Objects: lexical value in 'o', type info in 'ot'
+            o_str = term_to_string(o) or str(o)
+            ot_str = term_to_object_type(o)
 
-            triples.append({"s": s_str, "p": p_str, "o": o_str})
+            triples.append({"s": s_str, "p": p_str, "o": o_str, "ot": ot_str})
 
         if triples:
             with self.engine.connect() as conn:

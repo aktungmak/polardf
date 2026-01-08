@@ -2,7 +2,7 @@ import itertools
 import warnings
 from typing import List, Optional, Union
 
-from rdflib import Literal, URIRef
+from rdflib import Literal, URIRef, XSD
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -55,7 +55,8 @@ def term_to_object_type(term) -> Optional[str]:
 
     Returns:
     - None for URIRef and BNode (IRI/blank node)
-    - Datatype URI string for typed literals
+    - Datatype URI string for typed literals (xsd:string for plain literals per RDF 1.1)
+    - "@lang" for language-tagged literals
     - Empty string "" for plain literals (no datatype, no language)
     """
     if isinstance(term, Literal):
@@ -64,8 +65,7 @@ def term_to_object_type(term) -> Optional[str]:
         elif term.language:
             return f"@{term.language}"
         else:
-            # TODO should we set a default value for plain literals?
-            return ""  # Plain literal or BNode
+            return str(XSD.string)
     return None  # URIRef, BNode, or unknown
 
 
@@ -245,6 +245,11 @@ class AlgebraTranslator:
                 conditions.append(self.table.c.ot == o_type)
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
+
+        # If no variables to select, we still need a valid SELECT clause
+        # This happens when all triple positions are bound (existence check)
+        if not columns:
+            columns = [literal(1).label("_exists_")]
 
         query = select(*columns).select_from(self.table)
         if conditions:
