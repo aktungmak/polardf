@@ -839,5 +839,371 @@ class TestAlgebraTranslatorMulPath(unittest.TestCase):
         self.assertGreater(len(rows), 0, "Should find path from start to end")
 
 
+class TestValueEqualityAndSameTerm(unittest.TestCase):
+    """Tests for SPARQL value equality (=) and term identity (sameTerm) semantics.
+
+    Per SPARQL spec:
+    - `=` compares values: numeric types are compared by numeric value
+    - `sameTerm` compares RDF term identity: both value AND type must match
+    """
+
+    def setUp(self):
+        """Set up test fixtures with numeric literals of various types."""
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = AlgebraTranslator(
+            self.engine, table_name="triples", create_table=True
+        )
+
+        # Insert test data with various numeric types
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    # Same numeric value (1) with different types
+                    {
+                        "s": "http://ex.org/a",
+                        "p": "http://ex.org/val",
+                        "o": "1",
+                        "ot": str(XSD.integer),
+                    },
+                    {
+                        "s": "http://ex.org/b",
+                        "p": "http://ex.org/val",
+                        "o": "1.0",
+                        "ot": str(XSD.decimal),
+                    },
+                    {
+                        "s": "http://ex.org/c",
+                        "p": "http://ex.org/val",
+                        "o": "1.0e0",
+                        "ot": str(XSD.double),
+                    },
+                    # Another integer with same value as 'a'
+                    {
+                        "s": "http://ex.org/d",
+                        "p": "http://ex.org/val",
+                        "o": "1",
+                        "ot": str(XSD.integer),
+                    },
+                    # Different numeric value
+                    {
+                        "s": "http://ex.org/e",
+                        "p": "http://ex.org/val",
+                        "o": "2",
+                        "ot": str(XSD.integer),
+                    },
+                    # String with same lexical form as integer
+                    {
+                        "s": "http://ex.org/f",
+                        "p": "http://ex.org/val",
+                        "o": "1",
+                        "ot": str(XSD.string),
+                    },
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        """Clean up after each test method."""
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_value_equality_same_numeric_type(self):
+        """Test that = matches identical numeric values of same type."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(?v1 = ?v2)
+            FILTER(?s1 = ex:a)
+            FILTER(?s2 = ex:d)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # a and d both have "1"^^xsd:integer, should match
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].s1, "http://ex.org/a")
+        self.assertEqual(rows[0].s2, "http://ex.org/d")
+
+    def test_value_equality_cross_numeric_types(self):
+        """Test that = matches numeric values across different numeric types."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(?v1 = ?v2)
+            FILTER(?s1 < ?s2)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # Convert to set of pairs for easier checking
+        pairs = {(row.s1.split("/")[-1], row.s2.split("/")[-1]) for row in rows}
+
+        # All combinations of a, b, c, d should match (all have numeric value 1)
+        expected_numeric_pairs = {
+            ("a", "b"),
+            ("a", "c"),
+            ("a", "d"),
+            ("b", "c"),
+            ("b", "d"),
+            ("c", "d"),
+        }
+
+        for pair in expected_numeric_pairs:
+            self.assertIn(
+                pair, pairs, f"Numeric values should be equal: {pair[0]} = {pair[1]}"
+            )
+
+    def test_value_equality_different_values(self):
+        """Test that = does not match different numeric values."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(?v1 = ?v2)
+            FILTER(?s1 = ex:a)
+            FILTER(?s2 = ex:e)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # a has value 1, e has value 2 - should not match
+        self.assertEqual(len(rows), 0)
+
+    def test_value_equality_numeric_vs_string(self):
+        """Test that = does not match numeric and string with same lexical form."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(?v1 = ?v2)
+            FILTER(?s1 = ex:a)
+            FILTER(?s2 = ex:f)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # a is "1"^^xsd:integer, f is "1"^^xsd:string
+        # These are incompatible types, should not match
+        self.assertEqual(len(rows), 0)
+
+    def test_sameterm_identical_terms(self):
+        """Test that sameTerm matches only identical terms (same value AND type)."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(sameTerm(?v1, ?v2))
+            FILTER(?s1 < ?s2)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        pairs = {(row.s1.split("/")[-1], row.s2.split("/")[-1]) for row in rows}
+
+        # Only a and d should match (both "1"^^xsd:integer)
+        self.assertIn(("a", "d"), pairs)
+
+        # Should NOT include pairs with different types even if same numeric value
+        self.assertNotIn(("a", "b"), pairs)  # integer vs decimal
+        self.assertNotIn(("a", "c"), pairs)  # integer vs double
+        self.assertNotIn(("b", "c"), pairs)  # decimal vs double
+
+    def test_sameterm_different_types_same_lexical(self):
+        """Test that sameTerm does not match terms with same lexical form but different types."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s1 ?s2 WHERE {
+            ?s1 ex:val ?v1 .
+            ?s2 ex:val ?v2 .
+            FILTER(sameTerm(?v1, ?v2))
+            FILTER(?s1 = ex:a)
+            FILTER(?s2 = ex:f)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # a is "1"^^xsd:integer, f is "1"^^xsd:string
+        # Same lexical form but different types - sameTerm should NOT match
+        self.assertEqual(len(rows), 0)
+
+    def test_value_inequality_cross_types(self):
+        """Test that != correctly identifies different values across types."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE {
+            ?s ex:val ?v .
+            FILTER(?v != "1"^^<http://www.w3.org/2001/XMLSchema#integer>)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        subjects = {row.s.split("/")[-1] for row in rows}
+
+        # e has value 2 (different numeric value) - should be in results
+        self.assertIn("e", subjects)
+
+        # f has "1"^^xsd:string (different type) - should be in results
+        self.assertIn("f", subjects)
+
+        # a, b, c, d all have numeric value 1 - should NOT be in results
+        self.assertNotIn("a", subjects)
+        self.assertNotIn("b", subjects)
+        self.assertNotIn("c", subjects)
+        self.assertNotIn("d", subjects)
+
+    def test_numeric_comparison_less_than(self):
+        """Test that < correctly compares numeric values across types."""
+        # Insert additional test data
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    {
+                        "s": "http://ex.org/g",
+                        "p": "http://ex.org/val",
+                        "o": "0.5",
+                        "ot": str(XSD.decimal),
+                    },
+                ],
+            )
+            conn.commit()
+
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE {
+            ?s ex:val ?v .
+            FILTER(?v < "1"^^<http://www.w3.org/2001/XMLSchema#integer>)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        subjects = {row.s.split("/")[-1] for row in rows}
+
+        # g has value 0.5 - should be less than 1
+        self.assertIn("g", subjects)
+
+        # a, b, c, d all have value 1 - should NOT be less than 1
+        self.assertNotIn("a", subjects)
+        self.assertNotIn("b", subjects)
+        self.assertNotIn("c", subjects)
+        self.assertNotIn("d", subjects)
+
+    def test_numeric_comparison_greater_than(self):
+        """Test that > correctly compares numeric values across types."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE {
+            ?s ex:val ?v .
+            FILTER(?v > "1"^^<http://www.w3.org/2001/XMLSchema#integer>)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        subjects = {row.s.split("/")[-1] for row in rows}
+
+        # e has value 2 - should be greater than 1
+        self.assertIn("e", subjects)
+
+        # a, b, c, d all have value 1 - should NOT be greater than 1
+        self.assertNotIn("a", subjects)
+        self.assertNotIn("b", subjects)
+        self.assertNotIn("c", subjects)
+        self.assertNotIn("d", subjects)
+
+
+class TestValueEqualityWithLiterals(unittest.TestCase):
+    """Tests for value equality with literal values in FILTER expressions."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = AlgebraTranslator(
+            self.engine, table_name="triples", create_table=True
+        )
+
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    {
+                        "s": "http://ex.org/x",
+                        "p": "http://ex.org/num",
+                        "o": "42",
+                        "ot": str(XSD.integer),
+                    },
+                    {
+                        "s": "http://ex.org/y",
+                        "p": "http://ex.org/num",
+                        "o": "42.0",
+                        "ot": str(XSD.decimal),
+                    },
+                    {
+                        "s": "http://ex.org/z",
+                        "p": "http://ex.org/num",
+                        "o": "4.2e1",
+                        "ot": str(XSD.double),
+                    },
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_filter_equality_with_integer_literal(self):
+        """Test FILTER(?v = 42) matches all numeric representations of 42."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {
+            ?s ex:num ?v .
+            FILTER(?v = "42"^^xsd:integer)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        subjects = {row.s.split("/")[-1] for row in rows}
+
+        # All three should match (42 as integer, 42.0 as decimal, 4.2e1 as double)
+        self.assertEqual(subjects, {"x", "y", "z"})
+
+    def test_filter_equality_with_decimal_literal(self):
+        """Test FILTER(?v = 42.0) matches all numeric representations of 42."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {
+            ?s ex:num ?v .
+            FILTER(?v = "42.0"^^xsd:decimal)
+        }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        subjects = {row.s.split("/")[-1] for row in rows}
+
+        # All three should match
+        self.assertEqual(subjects, {"x", "y", "z"})
+
+
 if __name__ == "__main__":
     unittest.main()
