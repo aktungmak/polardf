@@ -615,7 +615,8 @@ def create_test_method(test_case: W3CTestCase):
             self.skipTest(f"Failed to parse expected results: {e}")
 
         # Convert actual results to comparable format
-        actual_vars = list(actual_rows[0]._fields) if actual_rows else []
+        # Use result.keys() to get column names (works even with empty results)
+        actual_vars = list(result.keys())
         actual_bindings = [dict(zip(actual_vars, row)) for row in actual_rows]
 
         # Compare results

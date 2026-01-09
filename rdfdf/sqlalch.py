@@ -36,7 +36,7 @@ from sqlalchemy.sql import column
 def term_to_string(term) -> Optional[str]:
     """Convert an RDF term (URIRef, Literal, or BNode) to its string representation.
 
-    Returns None if the term is not a recognized RDF term type (e.g., a Variable).
+    Returns None if the term is not a recognised RDF term type (e.g., a Variable).
 
     The format matches how terms are stored in the database:
     - URIRefs: the raw URI string
@@ -247,6 +247,8 @@ class AlgebraTranslator:
                 return self._translate_filter(pattern)
             elif pattern.name == "OrderBy":
                 return self._translate_order_by(pattern)
+            elif pattern.name == "Join":
+                return self._translate_join(pattern)
             else:
                 raise NotImplementedError(
                     f"Pattern type {pattern.name} not implemented"
@@ -570,11 +572,35 @@ class AlgebraTranslator:
 
         return base_select.order_by(*order_clauses)
 
+    def _translate_join(self, join):
+        """Translate a Join operation (natural join of two patterns).
+
+        Join combines two graph patterns using natural join semantics -
+        matching rows on common variables.
+        Structure: Join(p1=left_pattern, p2=right_pattern)
+        """
+        left_pattern = join["p1"]
+        right_pattern = join["p2"]
+
+        # Translate both sides
+        left_query = self._translate_pattern(left_pattern)
+        right_query = self._translate_pattern(right_pattern)
+
+        # Reuse _join_queries which handles natural join on common columns
+        return self._join_queries([left_query, right_query])
+
     def _translate_left_join(self, left_join):
-        """Translate a LeftJoin (OPTIONAL) operation."""
+        """Translate a LeftJoin (OPTIONAL) operation.
+
+        In SPARQL, OPTIONAL { pattern FILTER(expr) } becomes:
+        LeftJoin(p1, p2, expr) where expr is the filter condition.
+
+        The expr is applied as part of the ON condition of the LEFT JOIN,
+        NOT as a WHERE clause (which would filter out rows that don't match).
+        """
         left_pattern = left_join["p1"]
         right_pattern = left_join["p2"]
-        # expr = left_join["expr"]  # Join condition - TODO: handle filters
+        filter_expr = left_join.get("expr")
 
         # Translate both sides
         left_query = self._translate_pattern(left_pattern)
@@ -584,29 +610,39 @@ class AlgebraTranslator:
         left_cte = left_query if isinstance(left_query, CTE) else left_query.cte()
         right_cte = right_query if isinstance(right_query, CTE) else right_query.cte()
 
+        # Build var_to_column from both sides (left takes precedence for common cols)
+        var_to_column = {**right_cte.c, **left_cte.c}
+
         # Find common variables for join condition
         common_cols = set(left_cte.c.keys()) & set(right_cte.c.keys())
 
-        if common_cols:
-            join_conditions = [
-                left_cte.c[col] == right_cte.c[col] for col in common_cols
-            ]
+        # Build join conditions from common columns
+        join_conditions = [left_cte.c[col] == right_cte.c[col] for col in common_cols]
 
-            # All columns from both sides (deduplicated - common cols only from left)
-            all_columns = list(left_cte.c) + [
-                col for name, col in right_cte.c.items() if name not in common_cols
-            ]
+        # Add the filter expression to the join conditions if present
+        # (TrueFilter means no actual filter - just matches everything)
+        if filter_expr is not None:
+            if isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter":
+                pass  # No additional condition needed
+            else:
+                sql_filter = self._translate_expr(filter_expr, var_to_column)
+                join_conditions.append(sql_filter)
 
-            # LEFT JOIN - return Select (caller can wrap in CTE if needed)
-            return select(*all_columns).select_from(
-                left_cte.outerjoin(right_cte, and_(*join_conditions))
-            )
+        # All columns from both sides (deduplicated - common cols only from left)
+        all_columns = list(left_cte.c) + [
+            col for name, col in right_cte.c.items() if name not in common_cols
+        ]
+
+        # Build the ON condition
+        if join_conditions:
+            on_condition = and_(*join_conditions)
         else:
-            # If no common variables, it's a cartesian product with optional semantics
-            all_columns = list(left_cte.c) + list(right_cte.c)
-            return select(*all_columns).select_from(
-                left_cte.outerjoin(right_cte, true())
-            )
+            on_condition = true()
+
+        # LEFT JOIN
+        return select(*all_columns).select_from(
+            left_cte.outerjoin(right_cte, on_condition)
+        )
 
     # ---------- Expression Translation ----------
 
@@ -623,7 +659,11 @@ class AlgebraTranslator:
             var_name = str(expr)
             if var_name in var_to_column:
                 return var_to_column[var_name]
-            raise ValueError(f"Variable ?{var_name} not found in var_to_column")
+            # Unbound variable - return NULL to use SQL's NULL comparison semantics
+            # In SPARQL, comparisons with unbound variables produce errors, which are
+            # treated as FALSE in filter contexts. SQL's NULL comparison semantics
+            # achieve the same result: NULL = x evaluates to UNKNOWN, filtered out.
+            return null()
 
         # Base case: Literal or URIRef - convert to SQL literal string
         if isinstance(expr, (Literal, URIRef)):
