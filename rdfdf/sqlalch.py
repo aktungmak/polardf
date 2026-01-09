@@ -184,7 +184,7 @@ class AlgebraTranslator:
         """Convert query to a subquery/CTE for column access."""
         return query if isinstance(query, CTE) else query.subquery()
 
-    def _get_column_context(self, query) -> Dict[str, Column]:
+    def _get_var_to_column(self, query) -> Dict[str, Column]:
         """Build a variable->column mapping from query."""
         if isinstance(query, CTE):
             return {name: query.c[name] for name in query.c.keys()}
@@ -498,10 +498,10 @@ class AlgebraTranslator:
         # Translate the inner pattern
         inner_query = self._translate_pattern(inner_pattern)
         subquery = self._ensure_subquery(inner_query)
-        ctx = self._get_column_context(subquery)
+        var_to_column = self._get_var_to_column(subquery)
 
         # Translate the expression
-        sql_expr = self._translate_expr(expr, ctx)
+        sql_expr = self._translate_expr(expr, var_to_column)
 
         # Build result columns: all existing columns plus the new computed column
         result_columns = list(subquery.c) + [sql_expr.label(var_name)]
@@ -520,16 +520,16 @@ class AlgebraTranslator:
         # Translate the inner pattern
         inner_query = self._translate_pattern(inner_pattern)
 
-        # Build context from available columns
+        # Build var_to_column from available columns
         if isinstance(inner_query, CTE):
-            ctx = self._get_column_context(inner_query)
+            var_to_column = self._get_var_to_column(inner_query)
             base_select = select(*inner_query.c).select_from(inner_query)
         else:
-            ctx = self._get_column_context(inner_query)
+            var_to_column = self._get_var_to_column(inner_query)
             base_select = inner_query
 
         # Translate the filter expression
-        sql_condition = self._translate_expr(filter_expr, ctx)
+        sql_condition = self._translate_expr(filter_expr, var_to_column)
 
         # Add WHERE clause directly (no extra subquery)
         return base_select.where(sql_condition)
@@ -546,26 +546,26 @@ class AlgebraTranslator:
         # Translate the inner pattern
         inner_query = self._translate_pattern(inner_pattern)
 
-        # Build context for expression translation
+        # Build var_to_column for expression translation
         if isinstance(inner_query, CTE):
-            ctx = self._get_column_context(inner_query)
+            var_to_column = self._get_var_to_column(inner_query)
             base_select = select(*inner_query.c).select_from(inner_query)
         else:
-            ctx = self._get_column_context(inner_query)
+            var_to_column = self._get_var_to_column(inner_query)
             base_select = inner_query
 
         # Build ORDER BY clauses
         order_clauses = []
         for cond in order_conditions:
             if isinstance(cond, CompValue) and cond.name == "OrderCondition":
-                sql_expr = self._translate_expr(cond.expr, ctx)
+                sql_expr = self._translate_expr(cond.expr, var_to_column)
                 if cond.order == "DESC":
                     order_clauses.append(desc(sql_expr))
                 else:
                     order_clauses.append(asc(sql_expr))
             else:
                 # Just a variable or expression (default ASC)
-                sql_expr = self._translate_expr(cond, ctx)
+                sql_expr = self._translate_expr(cond, var_to_column)
                 order_clauses.append(asc(sql_expr))
 
         return base_select.order_by(*order_clauses)
@@ -610,20 +610,20 @@ class AlgebraTranslator:
 
     # ---------- Expression Translation ----------
 
-    def _translate_expr(self, expr, ctx):
+    def _translate_expr(self, expr, var_to_column):
         """Translate an rdflib SPARQL algebra expression (CompValue / term)
         into a SQLAlchemy expression.
 
         Args:
             expr: The expression to translate (Variable, Literal, or CompValue)
-            ctx: A dict mapping variable names to SQLAlchemy columns
+            var_to_column: A dict mapping variable names to SQLAlchemy columns
         """
-        # Base case: Variable - look up in context
+        # Base case: Variable - look up in var_to_column
         if isinstance(expr, Variable):
             var_name = str(expr)
-            if var_name in ctx:
-                return ctx[var_name]
-            raise ValueError(f"Variable ?{var_name} not found in context")
+            if var_name in var_to_column:
+                return var_to_column[var_name]
+            raise ValueError(f"Variable ?{var_name} not found in var_to_column")
 
         # Base case: Literal or URIRef - convert to SQL literal string
         if isinstance(expr, (Literal, URIRef)):
@@ -642,64 +642,64 @@ class AlgebraTranslator:
 
         # Dispatch to specific handlers
         if name == "RelationalExpression":
-            return self._translate_relational(expr, ctx)
+            return self._translate_relational(expr, var_to_column)
         if name == "ConditionalAndExpression":
-            return self._translate_conditional_and(expr, ctx)
+            return self._translate_conditional_and(expr, var_to_column)
         if name == "ConditionalOrExpression":
-            return self._translate_conditional_or(expr, ctx)
+            return self._translate_conditional_or(expr, var_to_column)
         if name == "UnaryNot":
-            return not_(self._translate_expr(expr.expr, ctx))
+            return not_(self._translate_expr(expr.expr, var_to_column))
         if name in ("AdditiveExpression", "MultiplicativeExpression"):
-            return self._translate_binary_chain(expr, ctx)
+            return self._translate_binary_chain(expr, var_to_column)
         if name == "InExpression":
-            return self._translate_in_expression(expr, ctx)
+            return self._translate_in_expression(expr, var_to_column)
         if name.startswith("Builtin_"):
-            return self._translate_builtin(expr, ctx)
+            return self._translate_builtin(expr, var_to_column)
         if name == "Aggregate":
-            return self._translate_aggregate(expr, ctx)
+            return self._translate_aggregate(expr, var_to_column)
 
         raise NotImplementedError(f"Expression kind {name!r} not handled by translator")
 
-    def _translate_relational(self, expr, ctx):
+    def _translate_relational(self, expr, var_to_column):
         """Translate a RelationalExpression (=, !=, <, >, <=, >=)."""
-        left = self._translate_expr(expr.expr, ctx)
-        right = self._translate_expr(expr.other, ctx)
+        left = self._translate_expr(expr.expr, var_to_column)
+        right = self._translate_expr(expr.other, var_to_column)
         op = expr.op
         if op in _RELATIONAL_OPS:
             return _RELATIONAL_OPS[op](left, right)
         raise NotImplementedError(f"Relational op {op!r} not supported")
 
-    def _translate_conditional_and(self, expr, ctx):
+    def _translate_conditional_and(self, expr, var_to_column):
         """Translate a ConditionalAndExpression (&&)."""
-        operands = [self._translate_expr(expr.expr, ctx)]
-        operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+        operands = [self._translate_expr(expr.expr, var_to_column)]
+        operands.extend(self._translate_expr(e, var_to_column) for e in expr.other)
         return and_(*operands)
 
-    def _translate_conditional_or(self, expr, ctx):
+    def _translate_conditional_or(self, expr, var_to_column):
         """Translate a ConditionalOrExpression (||)."""
-        operands = [self._translate_expr(expr.expr, ctx)]
-        operands.extend(self._translate_expr(e, ctx) for e in expr.other)
+        operands = [self._translate_expr(expr.expr, var_to_column)]
+        operands.extend(self._translate_expr(e, var_to_column) for e in expr.other)
         return or_(*operands)
 
-    def _translate_binary_chain(self, expr, ctx):
+    def _translate_binary_chain(self, expr, var_to_column):
         """Translate chained binary expressions (+/-, *//)."""
-        base = self._translate_expr(expr.expr, ctx)
+        base = self._translate_expr(expr.expr, var_to_column)
         ops = getattr(expr, "op", [])
         others = getattr(expr, "other", [])
         for op, other in zip(ops, others):
-            rhs = self._translate_expr(other, ctx)
+            rhs = self._translate_expr(other, var_to_column)
             if op not in _BINARY_OPS:
                 raise NotImplementedError(f"Binary op {op!r} not supported")
             base = _BINARY_OPS[op](base, rhs)
         return base
 
-    def _translate_in_expression(self, expr, ctx):
+    def _translate_in_expression(self, expr, var_to_column):
         """Translate IN / NOT IN expressions."""
-        lhs = self._translate_expr(expr.expr, ctx)
-        items = [self._translate_expr(v, ctx) for v in expr.other]
+        lhs = self._translate_expr(expr.expr, var_to_column)
+        items = [self._translate_expr(v, var_to_column) for v in expr.other]
         return lhs.not_in(items) if expr.notin else lhs.in_(items)
 
-    def _translate_builtin(self, expr, ctx):
+    def _translate_builtin(self, expr, var_to_column):
         """Translate SPARQL built-in functions (Builtin_XXX)."""
         fname = expr.name[8:].upper()  # Strip "Builtin_" prefix
 
@@ -707,7 +707,7 @@ class AlgebraTranslator:
         raw_args = getattr(expr, "arg", None) or getattr(expr, "args", [])
         if not isinstance(raw_args, list):
             raw_args = [raw_args]
-        args = [self._translate_expr(a, ctx) for a in raw_args]
+        args = [self._translate_expr(a, var_to_column) for a in raw_args]
 
         # --- Simple dispatch functions ---
         if fname in _BUILTIN_SIMPLE:
@@ -725,22 +725,22 @@ class AlgebraTranslator:
 
         # --- String functions with special handling ---
         if fname == "SUBSTR":
-            return self._translate_substr(expr, args, ctx)
+            return self._translate_substr(expr, args, var_to_column)
         if fname == "CONCAT":
             return self._translate_concat(args)
         if fname == "STR":
             return args[0]
         if fname == "STRSTARTS":
-            s = self._translate_expr(expr.arg1, ctx)
-            prefix = self._translate_expr(expr.arg2, ctx)
+            s = self._translate_expr(expr.arg1, var_to_column)
+            prefix = self._translate_expr(expr.arg2, var_to_column)
             return s.like(prefix.concat(literal("%")))
         if fname == "STRENDS":
-            s = self._translate_expr(expr.arg1, ctx)
-            suffix = self._translate_expr(expr.arg2, ctx)
+            s = self._translate_expr(expr.arg1, var_to_column)
+            suffix = self._translate_expr(expr.arg2, var_to_column)
             return s.like(literal("%").concat(suffix))
         if fname == "CONTAINS":
-            s = self._translate_expr(expr.arg1, ctx)
-            frag = self._translate_expr(expr.arg2, ctx)
+            s = self._translate_expr(expr.arg1, var_to_column)
+            frag = self._translate_expr(expr.arg2, var_to_column)
             return s.like(literal("%").concat(frag).concat(literal("%")))
 
         # --- Dialect-specific (stubs) ---
@@ -757,8 +757,8 @@ class AlgebraTranslator:
 
         # --- RDF term comparison ---
         if fname == "SAMETERM":
-            arg1 = self._translate_expr(expr.arg1, ctx)
-            arg2 = self._translate_expr(expr.arg2, ctx)
+            arg1 = self._translate_expr(expr.arg1, var_to_column)
+            arg2 = self._translate_expr(expr.arg2, var_to_column)
             return arg1 == arg2
 
         # --- Schema-dependent functions ---
@@ -767,14 +767,16 @@ class AlgebraTranslator:
 
         raise NotImplementedError(f"SPARQL built-in function {fname} is not supported")
 
-    def _translate_substr(self, expr, args, ctx):
+    def _translate_substr(self, expr, args, var_to_column):
         """Translate SUBSTR with its special argument structure."""
-        string_arg = args[0] if args else self._translate_expr(expr.arg, ctx)
+        string_arg = args[0] if args else self._translate_expr(expr.arg, var_to_column)
         start = (
-            self._translate_expr(expr.start, ctx) if hasattr(expr, "start") else None
+            self._translate_expr(expr.start, var_to_column)
+            if hasattr(expr, "start")
+            else None
         )
         length = (
-            self._translate_expr(expr.length, ctx)
+            self._translate_expr(expr.length, var_to_column)
             if hasattr(expr, "length") and expr.length is not None
             else None
         )
@@ -795,11 +797,13 @@ class AlgebraTranslator:
             result = result.concat(arg)
         return result
 
-    def _translate_aggregate(self, expr, ctx):
+    def _translate_aggregate(self, expr, var_to_column):
         """Translate aggregate expressions (COUNT, SUM, AVG, etc.)."""
         agg_name = expr.AggFunc.upper()
         agg_vars = getattr(expr, "vars", None)
-        arg = self._translate_expr(agg_vars[0], ctx) if agg_vars else literal(1)
+        arg = (
+            self._translate_expr(agg_vars[0], var_to_column) if agg_vars else literal(1)
+        )
         distinct = getattr(expr, "distinct", False)
 
         # COUNT has special handling for distinct
