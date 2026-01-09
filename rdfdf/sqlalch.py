@@ -29,6 +29,7 @@ from sqlalchemy import (
     not_,
     asc,
     desc,
+    exists,
 )
 from sqlalchemy.sql import column
 
@@ -202,11 +203,30 @@ class AlgebraTranslator:
 
     # ---------- Core Translation Methods ----------
 
-    def execute(self, sparql_query: str) -> CursorResult:
-        """Translate a SPARQL query and execute it."""
-        sql_query = self.translate(sparql_query)
-        with self.engine.connect() as conn:
-            return conn.execute(sql_query)
+    def execute(self, sparql_query: str) -> Union[CursorResult, bool]:
+        """Translate and execute a SPARQL query.
+
+        Returns:
+            CursorResult for SELECT queries
+            bool for ASK queries
+        """
+        query_tree = parser.parseQuery(sparql_query)
+        query_algebra = algebra.translateQuery(query_tree).algebra
+
+        if hasattr(query_algebra, "name"):
+            if query_algebra.name == "SelectQuery":
+                sql_query = self._translate_select_query(query_algebra)
+                with self.engine.connect() as conn:
+                    return conn.execute(sql_query)
+            elif query_algebra.name == "AskQuery":
+                sql_query = self._translate_ask_query(query_algebra)
+                with self.engine.connect() as conn:
+                    result = conn.execute(sql_query)
+                    return result.scalar()  # Returns the boolean value
+
+        raise NotImplementedError(
+            f"Query execution not implemented for {query_algebra}"
+        )
 
     def translate(self, sparql_string: str):
         """Translate a SPARQL query string to a SQLAlchemy query."""
@@ -215,6 +235,8 @@ class AlgebraTranslator:
         if hasattr(query_algebra, "name"):
             if query_algebra.name == "SelectQuery":
                 return self._translate_select_query(query_algebra)
+            elif query_algebra.name == "AskQuery":
+                return self._translate_ask_query(query_algebra)
 
         raise NotImplementedError(
             f"Algebra translation not implemented for {query_algebra}"
@@ -229,6 +251,19 @@ class AlgebraTranslator:
 
         # Otherwise, the base query is already a complete select, just return it
         return base_query
+
+    def _translate_ask_query(self, ask_query: CompValue):
+        """Translate ASK query to SELECT EXISTS(...) AS result."""
+        base_query = self._translate_pattern(ask_query["p"])
+
+        # Build subquery with LIMIT 1 for efficiency
+        if isinstance(base_query, CTE):
+            subq = select(literal(1)).select_from(base_query).limit(1)
+        else:
+            subq = base_query.limit(1)
+
+        # Wrap with EXISTS and return boolean result
+        return select(exists(subq).label("result"))
 
     def _translate_pattern(self, pattern):
         """Translate different pattern types."""

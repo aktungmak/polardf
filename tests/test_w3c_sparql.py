@@ -18,7 +18,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
@@ -345,11 +345,14 @@ class SparqlResultParser:
     """Parse SPARQL query results in various formats."""
 
     @staticmethod
-    def parse_srx(filepath: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def parse_srx(
+        filepath: str,
+    ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
         """Parse SPARQL Results XML format (.srx).
 
         Returns:
-            Tuple of (variable_names, list_of_bindings)
+            Tuple of (variable_names, list_of_bindings) for SELECT results
+            Tuple of ([], bool) for ASK results
         """
         import xml.etree.ElementTree as ET
 
@@ -358,6 +361,11 @@ class SparqlResultParser:
 
         # Namespace handling
         ns = {"sparql": "http://www.w3.org/2005/sparql-results#"}
+
+        # Check for ASK boolean result first
+        boolean_elem = root.find("sparql:boolean", ns)
+        if boolean_elem is not None:
+            return [], boolean_elem.text.lower() == "true"
 
         # Get variable names
         variables = []
@@ -404,10 +412,16 @@ class SparqlResultParser:
         return variables, bindings_list
 
     @staticmethod
-    def parse_ttl_results(filepath: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def parse_ttl_results(
+        filepath: str,
+    ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
         """Parse SPARQL results stored in Turtle format.
 
         The W3C test suite sometimes uses the result-set RDF vocabulary.
+
+        Returns:
+            Tuple of (variable_names, list_of_bindings) for SELECT results
+            Tuple of ([], bool) for ASK results
         """
         g = load_graph(filepath)
 
@@ -419,6 +433,11 @@ class SparqlResultParser:
 
         if not result_set:
             return [], []
+
+        # Check for ASK boolean result first
+        boolean_val = g.value(result_set, RS.boolean)
+        if boolean_val is not None:
+            return [], str(boolean_val).lower() == "true"
 
         # Get variables
         variables = []
@@ -452,7 +471,9 @@ class SparqlResultParser:
         return variables, bindings_list
 
     @classmethod
-    def parse(cls, filepath: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def parse(
+        cls, filepath: str
+    ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
         """Parse results file, auto-detecting format."""
         ext = Path(filepath).suffix.lower()
 
@@ -600,7 +621,6 @@ def create_test_method(test_case: W3CTestCase):
         # NotImplementedError means the feature isn't supported yet - skip the test
         try:
             result = self.translator.execute(query)
-            actual_rows = result.fetchall()
         except NotImplementedError as e:
             self.skipTest(f"Feature not implemented: {e}")
         except Exception as e:
@@ -608,11 +628,27 @@ def create_test_method(test_case: W3CTestCase):
 
         # Parse expected results
         try:
-            expected_vars, expected_bindings = SparqlResultParser.parse(
+            expected_vars, expected_result = SparqlResultParser.parse(
                 test_case.result_url
             )
         except Exception as e:
             self.skipTest(f"Failed to parse expected results: {e}")
+
+        # Handle ASK queries (result is a boolean)
+        if isinstance(result, bool):
+            if not isinstance(expected_result, bool):
+                self.fail(
+                    f"ASK query returned bool but expected results are not boolean"
+                )
+            if result != expected_result:
+                self.fail(
+                    f"ASK result mismatch for {test_case.name}: "
+                    f"actual={result}, expected={expected_result}"
+                )
+            return
+
+        # Handle SELECT queries (result is a CursorResult)
+        actual_rows = result.fetchall()
 
         # Convert actual results to comparable format
         # Use result.keys() to get column names (works even with empty results)
@@ -621,7 +657,7 @@ def create_test_method(test_case: W3CTestCase):
 
         # Compare results
         is_eq, reason = results_equivalent(
-            actual_vars, actual_bindings, expected_vars, expected_bindings
+            actual_vars, actual_bindings, expected_vars, expected_result
         )
 
         if not is_eq:
