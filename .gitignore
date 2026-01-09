@@ -4,5 +4,4 @@ __pycache__/
 *.pyc
 venv/
 
-# W3C test cache (downloaded test files)
-tests/.w3c_test_cache/
+tests/rdf-tests/
