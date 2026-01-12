@@ -40,7 +40,7 @@ class TestAlgebraTranslator(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -87,7 +87,7 @@ class TestAlgebraTranslator(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -112,7 +112,7 @@ class TestAlgebraTranslator(unittest.TestCase):
         ORDER BY ?o
         """
 
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -140,7 +140,7 @@ class TestAlgebraTranslator(unittest.TestCase):
         ORDER BY DESC(?o)
         """
 
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -168,7 +168,7 @@ class TestAlgebraTranslator(unittest.TestCase):
         ORDER BY ?s DESC(?o)
         """
 
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -679,7 +679,7 @@ class TestAlgebraTranslatorMulPath(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -705,7 +705,7 @@ class TestAlgebraTranslatorMulPath(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -731,7 +731,7 @@ class TestAlgebraTranslatorMulPath(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
@@ -757,7 +757,7 @@ class TestAlgebraTranslatorMulPath(unittest.TestCase):
         }"""
 
         # Translate the query
-        sql_query = self.translator.translate(sparql_query)
+        _, sql_query = self.translator.translate(sparql_query)
 
         # Verify it's a Select statement
         self.assertIsInstance(sql_query, Select)
