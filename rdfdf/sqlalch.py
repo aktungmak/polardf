@@ -2,7 +2,7 @@ import itertools
 import warnings
 from typing import Dict, List, Optional, Union
 
-from rdflib import Literal, URIRef, XSD
+from rdflib import BNode, Literal, URIRef, XSD
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -284,6 +284,8 @@ class AlgebraTranslator:
                 return self._translate_order_by(pattern)
             elif pattern.name == "Join":
                 return self._translate_join(pattern)
+            elif pattern.name == "Slice":
+                return self._translate_slice(pattern)
             else:
                 raise NotImplementedError(
                     f"Pattern type {pattern.name} not implemented"
@@ -342,8 +344,12 @@ class AlgebraTranslator:
         conditions = []
 
         # Subject
+        # BNodes in query patterns act as unnamed variables (match anything)
         if isinstance(s, Variable):
             columns.append(self.table.c.s.label(str(s)))
+        elif isinstance(s, BNode):
+            # Treat as unnamed variable with internal label
+            columns.append(self.table.c.s.label(f"_bnode_{s}"))
         elif (s_str := term_to_string(s)) is not None:
             conditions.append(self.table.c.s == s_str)
         else:
@@ -355,6 +361,8 @@ class AlgebraTranslator:
                 conditions.append(self.table.c.p == self.table.c.s)
             else:
                 columns.append(self.table.c.p.label(str(p)))
+        elif isinstance(p, BNode):
+            columns.append(self.table.c.p.label(f"_bnode_{p}"))
         elif (p_str := term_to_string(p)) is not None:
             conditions.append(self.table.c.p == p_str)
         else:
@@ -368,6 +376,8 @@ class AlgebraTranslator:
                 conditions.append(self.table.c.o == self.table.c.p)
             else:
                 columns.append(self.table.c.o.label(str(o)))
+        elif isinstance(o, BNode):
+            columns.append(self.table.c.o.label(f"_bnode_{o}"))
         elif (o_str := term_to_string(o)) is not None:
             conditions.append(self.table.c.o == o_str)
             o_type = term_to_object_type(o)
@@ -623,6 +633,35 @@ class AlgebraTranslator:
 
         # Reuse _join_queries which handles natural join on common columns
         return self._join_queries([left_query, right_query])
+
+    def _translate_slice(self, slice_node):
+        """Translate a Slice (LIMIT/OFFSET) operation.
+
+        Slice limits the number of results and/or skips some results.
+        Structure: Slice(p=inner_pattern, start=offset, length=limit)
+        """
+        inner_pattern = slice_node["p"]
+        start = getattr(slice_node, "start", 0)
+        length = getattr(slice_node, "length", None)
+
+        # Translate the inner pattern
+        inner_query = self._translate_pattern(inner_pattern)
+
+        # If it's a CTE, we need to select from it first
+        if isinstance(inner_query, CTE):
+            result_query = select(*inner_query.c).select_from(inner_query)
+        else:
+            result_query = inner_query
+
+        # Apply LIMIT
+        if length is not None:
+            result_query = result_query.limit(length)
+
+        # Apply OFFSET
+        if start is not None and start > 0:
+            result_query = result_query.offset(start)
+
+        return result_query
 
     def _translate_left_join(self, left_join):
         """Translate a LeftJoin (OPTIONAL) operation.

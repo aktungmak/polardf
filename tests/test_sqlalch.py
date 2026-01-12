@@ -551,6 +551,58 @@ class TestAlgebraTranslatorExecute(unittest.TestCase):
         self.assertEqual(rows[2].score, "50")
         self.assertEqual(rows[2].person, "http://example.org/charlie")
 
+    def test_execute_limit(self):
+        """Test LIMIT returns correct number of results."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?person ex:name ?name }
+        LIMIT 2
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+
+        # Should only return 2 results
+        self.assertEqual(len(rows), 2)
+
+    def test_execute_offset(self):
+        """Test OFFSET skips correct number of results."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?person ex:name ?name }
+        ORDER BY ?name
+        OFFSET 1
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        names = [row.name for row in rows]
+
+        # Should skip Alice, return Bob and Charlie
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(names, ["Bob", "Charlie"])
+
+    def test_execute_limit_offset(self):
+        """Test LIMIT and OFFSET together."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?person ex:name ?name }
+        ORDER BY ?name
+        LIMIT 1
+        OFFSET 1
+        """
+
+        result = self.translator.execute(sparql_query)
+        rows = result.fetchall()
+        names = [row.name for row in rows]
+
+        # Should skip Alice (offset 1), then return only 1 result (Bob)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(names, ["Bob"])
+
 
 class TestAlgebraTranslatorMulPath(unittest.TestCase):
     """Tests for MulPath translation and execution."""
