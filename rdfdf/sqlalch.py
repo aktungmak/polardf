@@ -2,28 +2,6 @@ import itertools
 from typing import Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, URIRef, XSD
-
-# XSD numeric type URIs for value equality comparison
-_NUMERIC_TYPES = frozenset(
-    [
-        str(XSD.integer),
-        str(XSD.decimal),
-        str(XSD.float),
-        str(XSD.double),
-        str(XSD.nonPositiveInteger),
-        str(XSD.negativeInteger),
-        str(XSD.long),
-        str(XSD.int),
-        str(XSD.short),
-        str(XSD.byte),
-        str(XSD.nonNegativeInteger),
-        str(XSD.unsignedLong),
-        str(XSD.unsignedInt),
-        str(XSD.unsignedShort),
-        str(XSD.unsignedByte),
-        str(XSD.positiveInteger),
-    ]
-)
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -98,7 +76,7 @@ def term_to_object_type(term) -> Optional[str]:
 
 # TODO this should be somewhere else
 def create_databricks_engine(
-    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     engine_uri = (
         f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
@@ -167,6 +145,25 @@ _SCHEMA_DEPENDENT_FUNCS = {
     "ISNUMERIC",
 }
 
+# XSD numeric type URIs for value equality comparison
+_NUMERIC_TYPES = {
+        str(XSD.integer),
+        str(XSD.decimal),
+        str(XSD.float),
+        str(XSD.double),
+        str(XSD.nonPositiveInteger),
+        str(XSD.negativeInteger),
+        str(XSD.long),
+        str(XSD.int),
+        str(XSD.short),
+        str(XSD.byte),
+        str(XSD.nonNegativeInteger),
+        str(XSD.unsignedLong),
+        str(XSD.unsignedInt),
+        str(XSD.unsignedShort),
+        str(XSD.unsignedByte),
+        str(XSD.positiveInteger),
+}
 
 def _get_var_to_column(query) -> Dict[str, Column]:
     """Build a variable->column mapping from query."""
@@ -203,7 +200,7 @@ class AlgebraTranslator:
     """Translates SPARQL algebra expressions to SQLAlchemy queries."""
 
     def __init__(
-        self, engine: Engine, table_name: str = "triples", create_table: bool = False
+            self, engine: Engine, table_name: str = "triples", create_table: bool = False
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -748,7 +745,7 @@ class AlgebraTranslator:
         if isinstance(expr, (Literal, URIRef)):
             # Handle boolean literals specially for FILTER expressions
             if isinstance(expr, Literal) and expr.datatype == URIRef(
-                "http://www.w3.org/2001/XMLSchema#boolean"
+                    "http://www.w3.org/2001/XMLSchema#boolean"
             ):
                 return true() if expr.toPython() else not_(true())
             return literal(str(expr))
@@ -792,7 +789,7 @@ class AlgebraTranslator:
 
         left_expr, right_expr = expr.expr, expr.other
 
-        # Normalize: if literal on left and variable on right, swap them
+        # Normalise: if literal on left and variable on right, swap them
         # (reversing op for ordering comparisons)
         left_type = self._get_type_column(left_expr, var_to_column)
         right_type = self._get_type_column(right_expr, var_to_column)
@@ -868,7 +865,7 @@ class AlgebraTranslator:
             )
 
     def _value_aware_comparison_with_literal(
-        self, var_value, var_type, lit_value, lit_type_str, op
+            self, var_value, var_type, lit_value, lit_type_str, op
     ):
         """Compare a variable (with type column) to a literal (with known type).
 
