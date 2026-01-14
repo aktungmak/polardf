@@ -495,7 +495,8 @@ def normalise_value(value: Any) -> Any:
 
     # Handle URIs - strip angle brackets
     # Expected results have <http://...>, our storage has http://...
-    if s.startswith("<") and s.endswith(">") and "://" in s and "^^" not in s:
+    # Check for any URI scheme (contains ":" after "<" and before ">")
+    if s.startswith("<") and s.endswith(">") and ":" in s[1:-1] and "^^" not in s:
         return s[1:-1]
 
     # Handle typed literals: "value"^^<datatype>

@@ -76,7 +76,7 @@ def term_to_object_type(term) -> Optional[str]:
 
 # TODO this should be somewhere else
 def create_databricks_engine(
-        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     engine_uri = (
         f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
@@ -147,23 +147,24 @@ _SCHEMA_DEPENDENT_FUNCS = {
 
 # XSD numeric type URIs for value equality comparison
 _NUMERIC_TYPES = {
-        str(XSD.integer),
-        str(XSD.decimal),
-        str(XSD.float),
-        str(XSD.double),
-        str(XSD.nonPositiveInteger),
-        str(XSD.negativeInteger),
-        str(XSD.long),
-        str(XSD.int),
-        str(XSD.short),
-        str(XSD.byte),
-        str(XSD.nonNegativeInteger),
-        str(XSD.unsignedLong),
-        str(XSD.unsignedInt),
-        str(XSD.unsignedShort),
-        str(XSD.unsignedByte),
-        str(XSD.positiveInteger),
+    str(XSD.integer),
+    str(XSD.decimal),
+    str(XSD.float),
+    str(XSD.double),
+    str(XSD.nonPositiveInteger),
+    str(XSD.negativeInteger),
+    str(XSD.long),
+    str(XSD.int),
+    str(XSD.short),
+    str(XSD.byte),
+    str(XSD.nonNegativeInteger),
+    str(XSD.unsignedLong),
+    str(XSD.unsignedInt),
+    str(XSD.unsignedShort),
+    str(XSD.unsignedByte),
+    str(XSD.positiveInteger),
 }
+
 
 def _get_var_to_column(query) -> Dict[str, Column]:
     """Build a variable->column mapping from query."""
@@ -200,7 +201,7 @@ class AlgebraTranslator:
     """Translates SPARQL algebra expressions to SQLAlchemy queries."""
 
     def __init__(
-            self, engine: Engine, table_name: str = "triples", create_table: bool = False
+        self, engine: Engine, table_name: str = "triples", create_table: bool = False
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -302,6 +303,8 @@ class AlgebraTranslator:
                 return self._translate_join(pattern)
             elif pattern.name == "Slice":
                 return self._translate_slice(pattern)
+            elif pattern.name == "Union":
+                return self._translate_union(pattern)
             else:
                 raise NotImplementedError(
                     f"Pattern type {pattern.name} not implemented"
@@ -488,29 +491,45 @@ class AlgebraTranslator:
         return final_query
 
     def _join_queries(self, queries: list):
-        """Natural join multiple queries on common variables."""
-        # no-op if only one argument
+        """Natural join multiple queries on common variables.
+
+        Uses SPARQL-compatible join semantics where unbound variables (NULL)
+        are treated as wildcards that match anything, not as distinct values.
+        """
         if len(queries) == 1:
             return queries[0]
 
-        # Convert all queries to CTEs
-        ctes = [query if isinstance(query, CTE) else query.cte() for query in queries]
+        ctes = [q if isinstance(q, CTE) else q.cte() for q in queries]
 
-        # Generate join conditions for all pairs of CTEs based on common columns
-        conditions = []
-        for left, right in itertools.combinations(ctes, 2):
-            common_cols = set(left.c.keys()) & set(right.c.keys())
-            for col in common_cols:
-                conditions.append(left.c[col] == right.c[col])
+        def sparql_join_cond(left_col, right_col, is_internal):
+            """SPARQL join: NULL matches anything for variables, strict for internals."""
+            if is_internal:
+                return left_col == right_col
+            return or_(left_col.is_(None), right_col.is_(None), left_col == right_col)
 
-        # Build column list: include each column name only once (avoid duplicates from joins)
-        projection_cols = {}
-        for cte in ctes:
-            for name, col in cte.c.items():
-                projection_cols.setdefault(name, col)
+        # Join conditions for all pairs of CTEs on common columns
+        conditions = [
+            sparql_join_cond(left.c[col], right.c[col], col.startswith("_"))
+            for left, right in itertools.combinations(ctes, 2)
+            for col in set(left.c.keys()) & set(right.c.keys())
+        ]
 
-        # Select deduplicated columns from all CTEs with WHERE conditions
-        return select(*projection_cols.values()).select_from(*ctes).where(*conditions)
+        # Collect all column names and identify which appear in multiple CTEs
+        all_col_names = {name for cte in ctes for name in cte.c.keys()}
+        cte_cols = {
+            name: [cte.c[name] for cte in ctes if name in cte.c.keys()]
+            for name in all_col_names
+        }
+
+        # Project columns: COALESCE for shared variables, direct reference otherwise
+        def project_col(name, cols):
+            if len(cols) > 1 and not name.startswith("_"):
+                return func.coalesce(*cols).label(name)
+            return cols[0]
+
+        final_cols = [project_col(name, cols) for name, cols in cte_cols.items()]
+
+        return select(*final_cols).select_from(*ctes).where(*conditions)
 
     def _translate_project(self, project: CompValue):
         """Translate a Project (SELECT) operation."""
@@ -720,6 +739,25 @@ class AlgebraTranslator:
             left_cte.outerjoin(right_cte, on_condition)
         )
 
+    def _translate_union(self, union: CompValue):
+        """Translate a Union operation (SPARQL UNION -> SQL UNION ALL)."""
+        left_q, right_q = (self._translate_pattern(union[k]) for k in ("p1", "p2"))
+        left_cte = left_q if isinstance(left_q, CTE) else left_q.cte()
+        right_cte = right_q if isinstance(right_q, CTE) else right_q.cte()
+
+        all_cols = sorted(_get_column_names(left_q) | _get_column_names(right_q))
+
+        def padded_select(cte):
+            """Select all columns, padding missing ones with NULL."""
+            return select(
+                *[
+                    cte.c[c].label(c) if c in cte.c.keys() else null().label(c)
+                    for c in all_cols
+                ]
+            ).select_from(cte)
+
+        return padded_select(left_cte).union_all(padded_select(right_cte))
+
     # ---------- Expression Translation ----------
 
     def _translate_expr(self, expr, var_to_column):
@@ -745,7 +783,7 @@ class AlgebraTranslator:
         if isinstance(expr, (Literal, URIRef)):
             # Handle boolean literals specially for FILTER expressions
             if isinstance(expr, Literal) and expr.datatype == URIRef(
-                    "http://www.w3.org/2001/XMLSchema#boolean"
+                "http://www.w3.org/2001/XMLSchema#boolean"
             ):
                 return true() if expr.toPython() else not_(true())
             return literal(str(expr))
@@ -865,7 +903,7 @@ class AlgebraTranslator:
             )
 
     def _value_aware_comparison_with_literal(
-            self, var_value, var_type, lit_value, lit_type_str, op
+        self, var_value, var_type, lit_value, lit_type_str, op
     ):
         """Compare a variable (with type column) to a literal (with known type).
 
