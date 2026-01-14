@@ -1093,7 +1093,11 @@ class TestValueEqualityAndSameTerm(unittest.TestCase):
         self.assertEqual(len(rows), 0)
 
     def test_value_inequality_cross_types(self):
-        """Test that != correctly identifies different values across types."""
+        """Test that != correctly identifies different values across types.
+
+        Per SPARQL semantics: comparing incompatible types produces a type error,
+        which in FILTER context means the row is excluded.
+        """
         query = """
         PREFIX ex: <http://ex.org/>
         SELECT ?s WHERE {
@@ -1109,8 +1113,10 @@ class TestValueEqualityAndSameTerm(unittest.TestCase):
         # e has value 2 (different numeric value) - should be in results
         self.assertIn("e", subjects)
 
-        # f has "1"^^xsd:string (different type) - should be in results
-        self.assertIn("f", subjects)
+        # f has "1"^^xsd:string (incompatible type with xsd:integer)
+        # Per SPARQL semantics, comparing incompatible types produces a type error
+        # Type errors in FILTER cause the row to be excluded
+        self.assertNotIn("f", subjects)
 
         # a, b, c, d all have numeric value 1 - should NOT be in results
         self.assertNotIn("a", subjects)

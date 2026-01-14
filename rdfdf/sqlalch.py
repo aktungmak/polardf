@@ -2,6 +2,28 @@ import itertools
 from typing import Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, URIRef, XSD
+
+# XSD numeric type URIs for value equality comparison
+_NUMERIC_TYPES = frozenset(
+    [
+        str(XSD.integer),
+        str(XSD.decimal),
+        str(XSD.float),
+        str(XSD.double),
+        str(XSD.nonPositiveInteger),
+        str(XSD.negativeInteger),
+        str(XSD.long),
+        str(XSD.int),
+        str(XSD.short),
+        str(XSD.byte),
+        str(XSD.nonNegativeInteger),
+        str(XSD.unsignedLong),
+        str(XSD.unsignedInt),
+        str(XSD.unsignedShort),
+        str(XSD.unsignedByte),
+        str(XSD.positiveInteger),
+    ]
+)
 from rdflib.paths import Path, SequencePath, MulPath
 from rdflib.plugins.sparql import parser, algebra
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -11,6 +33,7 @@ from sqlalchemy import (
     Table,
     Column,
     String,
+    Float,
     select,
     create_engine,
     true,
@@ -75,7 +98,7 @@ def term_to_object_type(term) -> Optional[str]:
 
 # TODO this should be somewhere else
 def create_databricks_engine(
-        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     engine_uri = (
         f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
@@ -168,9 +191,7 @@ def _ensure_subquery(query):
     return query if isinstance(query, CTE) else query.subquery()
 
 
-def _add_object_type_condition(
-        conditions: list, ot_column, o_type: Optional[str]
-):
+def _add_object_type_condition(conditions: list, ot_column, o_type: Optional[str]):
     """Add object type filtering condition to the conditions list."""
     if o_type is None:
         conditions.append(ot_column.is_(None))
@@ -179,11 +200,10 @@ def _add_object_type_condition(
 
 
 class AlgebraTranslator:
-    """Translates SPARQL algebra expressions to SQLAlchemy queries.
-    """
+    """Translates SPARQL algebra expressions to SQLAlchemy queries."""
 
     def __init__(
-            self, engine: Engine, table_name: str = "triples", create_table: bool = False
+        self, engine: Engine, table_name: str = "triples", create_table: bool = False
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -380,6 +400,8 @@ class AlgebraTranslator:
                 _add_object_type_condition(conditions, self.table.c.ot, None)
             else:
                 columns.append(self.table.c.o.label(str(o)))
+                # Also select the ot column for type information (needed for value equality)
+                columns.append(self.table.c.ot.label(f"_ot_{o}"))
         elif isinstance(o, BNode):
             # TODO this is also potentially incorrect
             columns.append(self.table.c.o.label(f"_bnode_{o}"))
@@ -420,9 +442,7 @@ class AlgebraTranslator:
         o_type = term_to_object_type(o) if not isinstance(o, Variable) else None
 
         # Base case: all direct edges with the predicate (need s, o, and ot for type filtering)
-        base_query = select(
-            self.table.c.s, self.table.c.o, self.table.c.ot
-        ).where(
+        base_query = select(self.table.c.s, self.table.c.o, self.table.c.ot).where(
             self.table.c.p == pred_value
         )
 
@@ -728,7 +748,7 @@ class AlgebraTranslator:
         if isinstance(expr, (Literal, URIRef)):
             # Handle boolean literals specially for FILTER expressions
             if isinstance(expr, Literal) and expr.datatype == URIRef(
-                    "http://www.w3.org/2001/XMLSchema#boolean"
+                "http://www.w3.org/2001/XMLSchema#boolean"
             ):
                 return true() if expr.toPython() else not_(true())
             return literal(str(expr))
@@ -761,13 +781,111 @@ class AlgebraTranslator:
         raise NotImplementedError(f"Expression kind {name!r} not implemented")
 
     def _translate_relational(self, expr, var_to_column):
-        """Translate a RelationalExpression (=, !=, <, >, <=, >=)."""
-        left = self._translate_expr(expr.expr, var_to_column)
-        right = self._translate_expr(expr.other, var_to_column)
+        """Translate a RelationalExpression (=, !=, <, >, <=, >=).
+
+        For SPARQL value equality, numeric types should be compared by value,
+        not lexical form. E.g., 1 = 01 is true for integers.
+        """
         op = expr.op
-        if op in _RELATIONAL_OPS:
-            return _RELATIONAL_OPS[op](left, right)
-        raise NotImplementedError(f"Relational op {op!r} not implemented")
+        if op not in _RELATIONAL_OPS:
+            raise NotImplementedError(f"Relational op {op!r} not implemented")
+
+        left_expr, right_expr = expr.expr, expr.other
+
+        # Normalize: if literal on left and variable on right, swap them
+        # (reversing op for ordering comparisons)
+        left_type = self._get_type_column(left_expr, var_to_column)
+        right_type = self._get_type_column(right_expr, var_to_column)
+        if right_type is not None and left_type is None:
+            left_expr, right_expr = right_expr, left_expr
+            left_type, right_type = right_type, left_type
+            op = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}.get(op, op)
+
+        left = self._translate_expr(left_expr, var_to_column)
+        right = self._translate_expr(right_expr, var_to_column)
+        right_literal_type = self._get_literal_type(right_expr)
+
+        # Case 1: variable vs literal (left has type column, right has literal type)
+        if left_type is not None and right_literal_type is not None:
+            return self._value_aware_comparison_with_literal(
+                left, left_type, right, right_literal_type, op
+            )
+
+        # Case 2: variable vs variable (both have type columns)
+        if left_type is not None and right_type is not None:
+            return self._value_aware_comparison(left, left_type, right, right_type, op)
+
+        # Case 3: simple comparison (URIs, etc.)
+        return _RELATIONAL_OPS[op](left, right)
+
+    def _get_type_column(self, expr, var_to_column):
+        """Get the type column for an expression if it's a variable with type info."""
+        if isinstance(expr, Variable):
+            type_col_name = f"_ot_{expr}"
+            if type_col_name in var_to_column:
+                return var_to_column[type_col_name]
+        return None
+
+    def _get_literal_type(self, expr):
+        """Get the datatype URI string for a Literal expression."""
+        if isinstance(expr, Literal):
+            if expr.datatype:
+                return str(expr.datatype)
+            elif expr.language:
+                return f"@{expr.language}"
+            else:
+                return str(XSD.string)
+        return None
+
+    def _value_aware_comparison(self, left, left_type, right, right_type, op):
+        """Generate SQL for value-aware comparison (handles numeric types).
+
+        When both operands are numeric types, compares numeric values.
+        Otherwise compares lexically, but only if types are compatible.
+        IRIs and BNodes have NULL type columns, handled via IS NULL checks.
+        """
+        numeric_types = [literal(t) for t in _NUMERIC_TYPES]
+        both_numeric = and_(left_type.in_(numeric_types), right_type.in_(numeric_types))
+        lexical_compatible = or_(
+            and_(left_type.is_(None), right_type.is_(None)),  # both IRIs/BNodes
+            and_(
+                left_type.isnot(None), right_type.isnot(None), left_type == right_type
+            ),
+        )
+
+        left_real, right_real = func.cast(left, Float), func.cast(right, Float)
+        cmp_op = _RELATIONAL_OPS[op]
+
+        if op in ("=", "!="):
+            equal_cond = or_(
+                and_(both_numeric, left_real == right_real),
+                and_(lexical_compatible, left == right),
+            )
+            return equal_cond if op == "=" else not_(equal_cond)
+        else:  # <, >, <=, >=
+            return case(
+                (both_numeric, cmp_op(left_real, right_real)), else_=cmp_op(left, right)
+            )
+
+    def _value_aware_comparison_with_literal(
+        self, var_value, var_type, lit_value, lit_type_str, op
+    ):
+        """Compare a variable (with type column) to a literal (with known type).
+
+        SPARQL semantics: incompatible types produce type error (row excluded).
+        """
+        cmp_op = _RELATIONAL_OPS[op]
+
+        if lit_type_str in _NUMERIC_TYPES:
+            # Numeric literal: require var to also be numeric, compare as floats
+            var_is_numeric = var_type.in_([literal(t) for t in _NUMERIC_TYPES])
+            return and_(
+                var_is_numeric,
+                cmp_op(func.cast(var_value, Float), func.cast(lit_value, Float)),
+            )
+        else:
+            # Non-numeric literal: require same type, compare lexically
+            return and_(var_type == literal(lit_type_str), cmp_op(var_value, lit_value))
 
     def _translate_conditional_and(self, expr, var_to_column):
         """Translate a ConditionalAndExpression (&&)."""
@@ -845,7 +963,9 @@ class AlgebraTranslator:
 
         # --- Dialect-specific (stubs) ---
         if fname in ("REGEX", "REPLACE"):
-            raise NotImplementedError(f"{fname} mapping is dialect-specific and not implemented")
+            raise NotImplementedError(
+                f"{fname} mapping is dialect-specific and not implemented"
+            )
 
         # --- Date/time extraction ---
         if fname in _DATETIME_FIELDS:
@@ -859,14 +979,38 @@ class AlgebraTranslator:
         if fname == "SAMETERM":
             arg1 = self._translate_expr(expr.arg1, var_to_column)
             arg2 = self._translate_expr(expr.arg2, var_to_column)
-            # TODO also need to check ot if this is the o column
-            return arg1 == arg2
+
+            # sameTerm requires both value AND type to match
+            # Get type columns for both operands
+            type1 = self._get_type_column(expr.arg1, var_to_column)
+            type2 = self._get_type_column(expr.arg2, var_to_column)
+
+            if type1 is not None and type2 is not None:
+                # Both have type info: require value AND type match
+                # NULL types (for IRIs/bnodes) should match with IS NULL
+                return and_(
+                    arg1 == arg2,
+                    or_(
+                        and_(type1.is_(None), type2.is_(None)),
+                        type1 == type2,
+                    ),
+                )
+            elif type1 is not None or type2 is not None:
+                # Mixed: one has type, one doesn't - need careful handling
+                # If one is from object column (has type) and one is literal,
+                # they can only match if the literal's type matches
+                return arg1 == arg2
+            else:
+                # Neither has type info - simple value comparison
+                return arg1 == arg2
 
         # --- Schema-dependent functions ---
         if fname in _SCHEMA_DEPENDENT_FUNCS:
             raise NotImplementedError(f"{fname} requires schema-specific mapping")
 
-        raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
+        raise NotImplementedError(
+            f"SPARQL built-in function {fname} is not implemented"
+        )
 
     def _translate_substr(self, expr, args, var_to_column):
         """Translate SUBSTR with its special argument structure."""
