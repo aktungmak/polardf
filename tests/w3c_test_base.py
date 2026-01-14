@@ -20,11 +20,18 @@ from pathlib import Path
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Any, Union
 
+import rdflib
 from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
 from sqlalchemy import create_engine
 
 from rdfdf.sqlalch import AlgebraTranslator, term_to_string, term_to_object_type
+
+
+# Disable rdflib's literal normalisation to preserve original lexical forms.
+# By default, rdflib normalises typed literals (e.g., "01"^^xsd:integer becomes "1").
+# SPARQL semantics require preserving the original lexical form for correct results.
+rdflib.NORMALIZE_LITERALS = False
 
 
 # W3C Test Suite namespaces
