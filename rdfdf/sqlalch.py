@@ -552,18 +552,23 @@ class AlgebraTranslator:
             return base_query
 
         # Build projection columns
-        # - Variables that exist in base query: select from subquery
+        # - Variables that exist in base query: select from the query's columns
         # - Variables that don't exist: add as NULL (unbound in SPARQL)
-        subquery = base_query.subquery()
-        var_columns = []
-        for var in project_vars:
-            var_name = str(var)
-            if var_name in base_cols:
-                var_columns.append(column(var_name))
-            else:
-                var_columns.append(null().label(var_name))
-
-        return select(*var_columns).select_from(subquery)
+        if isinstance(base_query, CTE):
+            # For CTEs, we need to select from them
+            var_columns = [
+                base_query.c[str(var)] if str(var) in base_cols else null().label(str(var))
+                for var in project_vars
+            ]
+            return select(*var_columns).select_from(base_query)
+        else:
+            # For Select objects, use with_only_columns to preserve ORDER BY
+            var_to_col = {col.key: col for col in base_query.selected_columns}
+            var_columns = [
+                var_to_col[str(var)] if str(var) in var_to_col else null().label(str(var))
+                for var in project_vars
+            ]
+            return base_query.with_only_columns(*var_columns)
 
     def _translate_distinct(self, distinct: CompValue):
         """Translate a Distinct operation."""

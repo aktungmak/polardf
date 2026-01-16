@@ -49,22 +49,6 @@ class TestAlgebraTranslator(unittest.TestCase):
         selected_column_names = {col.key for col in sql_query.selected_columns}
         self.assertEqual(selected_column_names, {"cat", "tab"})
 
-        # Check that the query uses a subquery (for the joins)
-        froms = sql_query.get_final_froms()
-        self.assertEqual(len(froms), 1)
-
-        # The FROM should be a subquery
-        subquery = froms[0]
-        self.assertIsInstance(subquery, Subquery)
-
-        # The subquery should have 3 CTEs involved (one for each triple pattern)
-        # We can verify this by checking the subquery's element
-        inner_select = subquery.element
-        self.assertIsInstance(inner_select, Select)
-
-        # Check that there are WHERE conditions in the subquery (for the joins)
-        self.assertIsNotNone(inner_select.whereclause)
-
         # Verify the query is executable (doesn't raise an error when compiled)
         try:
             compiled = sql_query.compile()
