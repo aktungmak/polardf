@@ -262,6 +262,7 @@ class AlgebraTranslator:
         return query_type, q
 
     def _translate_select_query(self, select_query: CompValue):
+        assert select_query.name == "SelectQuery"
         base_query = self._translate_pattern(select_query["p"])
 
         # If the base query is a CTE, we need to select from it
@@ -273,6 +274,7 @@ class AlgebraTranslator:
 
     def _translate_ask_query(self, ask_query: CompValue):
         """Translate ASK query to SELECT EXISTS(...) AS result."""
+        assert ask_query.name == "AskQuery"
         base_query = self._translate_pattern(ask_query["p"])
 
         # We only care that at least one result exists, so add LIMIT 1
@@ -320,7 +322,6 @@ class AlgebraTranslator:
 
     def _translate_bgp(self, bgp: CompValue) -> Union[Select, CTE]:
         """Translate a Basic Graph Pattern to a query."""
-        # TODO add assertions like these to the other _translate* methods
         assert bgp.name == "BGP"
         triples = bgp["triples"]
 
@@ -539,6 +540,7 @@ class AlgebraTranslator:
 
     def _translate_project(self, project: CompValue):
         """Translate a Project (SELECT) operation."""
+        assert project.name == "Project"
         project_vars = project["PV"]
         pattern = project["p"]
 
@@ -586,6 +588,7 @@ class AlgebraTranslator:
 
     def _translate_distinct(self, distinct: CompValue):
         """Translate a Distinct operation."""
+        assert distinct.name == "Distinct"
         inner_query = self._translate_pattern(distinct["p"])
 
         # If it's a CTE, select from it with distinct
@@ -601,6 +604,7 @@ class AlgebraTranslator:
         The Extend node adds a new variable binding computed from an expression.
         Structure: Extend(p=inner_pattern, var=new_variable_name, expr=expression)
         """
+        assert extend.name == "Extend"
         inner_query = self._translate_pattern(extend["p"])
         cte = _ensure_cte(inner_query)
         var_to_column = _get_var_to_column(cte)
@@ -616,6 +620,7 @@ class AlgebraTranslator:
         Filter applies a boolean expression to filter results from the inner pattern.
         Structure: Filter(p=inner_pattern, expr=boolean_expression)
         """
+        assert filter_.name == "Filter"
         inner_query = self._translate_pattern(filter_["p"])
 
         # Build var_to_column mapping from available columns
@@ -638,6 +643,7 @@ class AlgebraTranslator:
         OrderBy applies ordering to results from the inner pattern.
         Structure: OrderBy(p=inner_pattern, expr=list_of_order_conditions)
         """
+        assert order_by.name == "OrderBy"
         inner_query = self._translate_pattern(order_by["p"])
 
         # Build var_to_column for expression translation
@@ -671,6 +677,7 @@ class AlgebraTranslator:
         matching rows on common variables.
         Structure: Join(p1=left_pattern, p2=right_pattern)
         """
+        assert join.name == "Join"
         left_query = self._translate_pattern(join["p1"])
         right_query = self._translate_pattern(join["p2"])
 
@@ -682,6 +689,7 @@ class AlgebraTranslator:
         Slice limits the number of results and/or skips some results.
         Structure: Slice(p=inner_pattern, start=offset, length=limit)
         """
+        assert slice_.name == "Slice"
         start = getattr(slice_, "start", 0)
         length = getattr(slice_, "length", None)
 
@@ -712,6 +720,7 @@ class AlgebraTranslator:
         The expr is applied as part of the ON condition of the LEFT JOIN,
         NOT as a WHERE clause (which would filter out rows that don't match).
         """
+        assert left_join.name == "LeftJoin"
         left_query = self._translate_pattern(left_join["p1"])
         right_query = self._translate_pattern(left_join["p2"])
         filter_expr = left_join.get("expr")
@@ -755,6 +764,7 @@ class AlgebraTranslator:
 
     def _translate_union(self, union: CompValue):
         """Translate a Union operation (SPARQL UNION -> SQL UNION ALL)."""
+        assert union.name == "Union"
         left_q, right_q = (self._translate_pattern(union[k]) for k in ("p1", "p2"))
         left_cte = _ensure_cte(left_q)
         right_cte = _ensure_cte(right_q)
@@ -773,7 +783,8 @@ class AlgebraTranslator:
         return padded_select(left_cte).union_all(padded_select(right_cte))
 
     def _translate_group(self, group: CompValue):
-        """Translate a Group operation"""
+        """Translate a Group operation."""
+        assert group.name == "Group"
         return self._translate_pattern(group["p"])
 
     def _translate_aggregate_join(self, agg_join: CompValue):
@@ -782,6 +793,7 @@ class AlgebraTranslator:
         AggregateJoin outputs only aggregate result variables
         Grouping columns are recreated by outer Extend operations.
         """
+        assert agg_join.name == "AggregateJoin"
         inner_query = self._translate_pattern(agg_join["p"])
         cte = _ensure_cte(inner_query)
         var_to_column = _get_var_to_column(cte)
@@ -864,6 +876,7 @@ class AlgebraTranslator:
         For SPARQL value equality, numeric types should be compared by value,
         not lexical form. E.g., 1 = 01 is true for integers.
         """
+        assert expr.name == "RelationalExpression"
         op = expr.op
         if op not in _RELATIONAL_OPS:
             raise NotImplementedError(f"Relational op {op!r} not implemented")
@@ -967,18 +980,21 @@ class AlgebraTranslator:
 
     def _translate_conditional_and(self, expr, var_to_column):
         """Translate a ConditionalAndExpression (&&)."""
+        assert expr.name == "ConditionalAndExpression"
         operands = [self._translate_expr(expr.expr, var_to_column)]
         operands.extend(self._translate_expr(e, var_to_column) for e in expr.other)
         return and_(*operands)
 
     def _translate_conditional_or(self, expr, var_to_column):
         """Translate a ConditionalOrExpression (||)."""
+        assert expr.name == "ConditionalOrExpression"
         operands = [self._translate_expr(expr.expr, var_to_column)]
         operands.extend(self._translate_expr(e, var_to_column) for e in expr.other)
         return or_(*operands)
 
     def _translate_binary_chain(self, expr, var_to_column):
         """Translate chained binary expressions (+/-, *//)."""
+        assert expr.name in ("AdditiveExpression", "MultiplicativeExpression")
         base = self._translate_expr(expr.expr, var_to_column)
         ops = getattr(expr, "op", [])
         others = getattr(expr, "other", [])
@@ -991,6 +1007,7 @@ class AlgebraTranslator:
 
     def _translate_in_expression(self, expr, var_to_column):
         """Translate IN / NOT IN expressions."""
+        assert expr.name == "InExpression"
         lhs = self._translate_expr(expr.expr, var_to_column)
         items = [self._translate_expr(v, var_to_column) for v in expr.other]
         return lhs.not_in(items) if expr.notin else lhs.in_(items)
