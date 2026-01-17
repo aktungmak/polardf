@@ -780,7 +780,7 @@ class AlgebraTranslator:
                 ]
             ).select_from(cte)
 
-        return padded_select(left_cte).union_all(padded_select(right_cte))
+        return padded_select(left_cte).union_all(padded_select(right_cte)).cte()
 
     def _translate_group(self, group: CompValue):
         """Translate a Group operation."""
