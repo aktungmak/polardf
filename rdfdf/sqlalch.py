@@ -820,16 +820,18 @@ class AlgebraTranslator:
             # achieve the same result: NULL = x evaluates to UNKNOWN, filtered out.
             return null()
 
-        # Literal or URIRef - convert to SQL literal string
-        if isinstance(expr, (Literal, URIRef)):
-            # Handle boolean literals specially for FILTER expressions
-            if isinstance(expr, Literal) and expr.datatype == URIRef(
-                "http://www.w3.org/2001/XMLSchema#boolean"
-            ):
+        # Literal - handle booleans and numerics specially, else stringify
+        elif isinstance(expr, Literal):
+            if expr.datatype == XSD.boolean:
                 return true() if expr.toPython() else not_(true())
+            if expr.datatype and str(expr.datatype) in _NUMERIC_TYPES:
+                return literal(expr.toPython())
             return literal(str(expr))
 
-        if not isinstance(expr, CompValue):
+        elif isinstance(expr, URIRef):
+            return literal(str(expr))
+
+        elif not isinstance(expr, CompValue):
             # raw constant or already an expression
             # TODO check how we can end up here - it seems like we could miss errors here
             return literal(expr)
@@ -839,22 +841,22 @@ class AlgebraTranslator:
         # Dispatch to specific handlers
         if name == "RelationalExpression":
             return self._translate_relational(expr, var_to_column)
-        if name == "ConditionalAndExpression":
+        elif name == "ConditionalAndExpression":
             return self._translate_conditional_and(expr, var_to_column)
-        if name == "ConditionalOrExpression":
+        elif name == "ConditionalOrExpression":
             return self._translate_conditional_or(expr, var_to_column)
-        if name == "UnaryNot":
+        elif name == "UnaryNot":
             return not_(self._translate_expr(expr.expr, var_to_column))
-        if name in ("AdditiveExpression", "MultiplicativeExpression"):
+        elif name in ("AdditiveExpression", "MultiplicativeExpression"):
             return self._translate_binary_chain(expr, var_to_column)
-        if name == "InExpression":
+        elif name == "InExpression":
             return self._translate_in_expression(expr, var_to_column)
-        if name.startswith("Builtin_"):
+        elif name.startswith("Builtin_"):
             return self._translate_builtin(expr, var_to_column)
-        if name.startswith("Aggregate_"):
+        elif name.startswith("Aggregate_"):
             return self._translate_aggregate_expr(expr, var_to_column)
-
-        raise NotImplementedError(f"Expression kind {name!r} not implemented")
+        else:
+            raise NotImplementedError(f"Expression kind {name!r} not implemented")
 
     def _translate_relational(self, expr, var_to_column):
         """Translate a RelationalExpression (=, !=, <, >, <=, >=).

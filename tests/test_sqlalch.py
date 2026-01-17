@@ -1371,6 +1371,78 @@ class TestGroupByAndAggregates(unittest.TestCase):
         self.assertEqual(results["Sales"], (2, 170.0, 85.0))
 
 
+class TestHavingClause(unittest.TestCase):
+    """Tests for SPARQL HAVING clause filtering on aggregate results."""
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = AlgebraTranslator(
+            self.engine, table_name="triples", create_table=True
+        )
+        # Insert test data: predicates with varying occurrence counts
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    {"s": "s1", "p": "p1", "o": "o1", "ot": None},
+                    {"s": "s2", "p": "p1", "o": "o2", "ot": None},
+                    {"s": "s3", "p": "p1", "o": "o3", "ot": None},  # p1: count=3
+                    {"s": "s4", "p": "p2", "o": "o4", "ot": None},
+                    {"s": "s5", "p": "p2", "o": "o5", "ot": None},  # p2: count=2
+                    {"s": "s6", "p": "p3", "o": "o6", "ot": None},  # p3: count=1
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_having_greater_than(self):
+        """Test HAVING with > filters groups by aggregate result."""
+        query = """
+        SELECT ?p (COUNT(?o) AS ?c)
+        WHERE { ?s ?p ?o }
+        GROUP BY ?p
+        HAVING (COUNT(?o) > 1)
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+        results = {row.p: int(row.c) for row in rows}
+
+        # Only p1 (count=3) and p2 (count=2) should match
+        self.assertEqual(results, {"p1": 3, "p2": 2})
+
+    def test_having_equals(self):
+        """Test HAVING with = filters to exact aggregate value."""
+        query = """
+        SELECT ?p (COUNT(?o) AS ?c)
+        WHERE { ?s ?p ?o }
+        GROUP BY ?p
+        HAVING (COUNT(?o) = 2)
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+        results = {row.p: int(row.c) for row in rows}
+
+        self.assertEqual(results, {"p2": 2})
+
+    def test_having_multiple_conditions(self):
+        """Test multiple HAVING conditions (implicit AND)."""
+        query = """
+        SELECT ?p (COUNT(?o) AS ?c)
+        WHERE { ?s ?p ?o }
+        GROUP BY ?p
+        HAVING (COUNT(?o) > 1) (COUNT(?o) < 3)
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+        results = {row.p: int(row.c) for row in rows}
+
+        # Only p2 (count=2) satisfies both conditions
+        self.assertEqual(results, {"p2": 2})
+
+
 class TestValueEqualityWithLiterals(unittest.TestCase):
     """Tests for value equality with literal values in FILTER expressions."""
 
