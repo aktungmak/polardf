@@ -127,12 +127,14 @@ _HASH_FUNCS = {"SHA1", "SHA256", "SHA384", "SHA512"}
 # Date/time extraction fields
 _DATETIME_FIELDS = {"YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS"}
 
-# Aggregate functions that map directly
+# Aggregate pattern names -> SQL functions
 _AGG_FUNCS = {
-    "SUM": func.sum,
-    "AVG": func.avg,
-    "MIN": func.min,
-    "MAX": func.max,
+    "Aggregate_Count": func.count,
+    "Aggregate_Sum": func.sum,
+    "Aggregate_Avg": func.avg,
+    "Aggregate_Min": func.min,
+    "Aggregate_Max": func.max,
+    "Aggregate_Sample": func.min,  # SAMPLE falls back to MIN
 }
 
 # RDF term helpers that require schema-specific mapping
@@ -184,9 +186,9 @@ def _get_column_names(query) -> set:
     return set()
 
 
-def _ensure_subquery(query):
-    """Convert query to a subquery/CTE for column access."""
-    return query if isinstance(query, CTE) else query.subquery()
+def _ensure_cte(query):
+    """Convert query to a CTE for column access via .c attribute."""
+    return query if isinstance(query, CTE) else query.cte()
 
 
 def _add_object_type_condition(conditions: list, ot_column, o_type: Optional[str]):
@@ -305,6 +307,10 @@ class AlgebraTranslator:
                 return self._translate_slice(pattern)
             elif pattern.name == "Union":
                 return self._translate_union(pattern)
+            elif pattern.name == "Group":
+                return self._translate_group(pattern)
+            elif pattern.name == "AggregateJoin":
+                return self._translate_aggregate_join(pattern)
             else:
                 raise NotImplementedError(
                     f"Pattern type {pattern.name} not implemented"
@@ -499,7 +505,7 @@ class AlgebraTranslator:
         if len(queries) == 1:
             return queries[0]
 
-        ctes = [q if isinstance(q, CTE) else q.cte() for q in queries]
+        ctes = [_ensure_cte(q) for q in queries]
 
         def sparql_join_cond(left_col, right_col, is_internal):
             """SPARQL join: NULL matches anything for variables, strict for internals."""
@@ -557,7 +563,11 @@ class AlgebraTranslator:
         if isinstance(base_query, CTE):
             # For CTEs, we need to select from them
             var_columns = [
-                base_query.c[str(var)] if str(var) in base_cols else null().label(str(var))
+                (
+                    base_query.c[str(var)]
+                    if str(var) in base_cols
+                    else null().label(str(var))
+                )
                 for var in project_vars
             ]
             return select(*var_columns).select_from(base_query)
@@ -565,7 +575,11 @@ class AlgebraTranslator:
             # For Select objects, use with_only_columns to preserve ORDER BY
             var_to_col = {col.key: col for col in base_query.selected_columns}
             var_columns = [
-                var_to_col[str(var)] if str(var) in var_to_col else null().label(str(var))
+                (
+                    var_to_col[str(var)]
+                    if str(var) in var_to_col
+                    else null().label(str(var))
+                )
                 for var in project_vars
             ]
             return base_query.with_only_columns(*var_columns)
@@ -587,18 +601,14 @@ class AlgebraTranslator:
         The Extend node adds a new variable binding computed from an expression.
         Structure: Extend(p=inner_pattern, var=new_variable_name, expr=expression)
         """
-        # Translate the inner pattern
         inner_query = self._translate_pattern(extend["p"])
-        subquery = _ensure_subquery(inner_query)
-        var_to_column = _get_var_to_column(subquery)
+        cte = _ensure_cte(inner_query)
+        var_to_column = _get_var_to_column(cte)
 
-        # Translate the expression
         sql_expr = self._translate_expr(extend["expr"], var_to_column)
+        result_columns = list(cte.c) + [sql_expr.label(str(extend["var"]))]
 
-        # Build result columns: all existing columns plus the new computed column
-        result_columns = list(subquery.c) + [sql_expr.label(str(extend["var"]))]
-
-        return select(*result_columns).select_from(subquery)
+        return select(*result_columns).select_from(cte)
 
     def _translate_filter(self, filter_: CompValue):
         """Translate a Filter operation.
@@ -706,9 +716,8 @@ class AlgebraTranslator:
         right_query = self._translate_pattern(left_join["p2"])
         filter_expr = left_join.get("expr")
 
-        # Convert to CTEs for joining if they aren't already
-        left_cte = left_query if isinstance(left_query, CTE) else left_query.cte()
-        right_cte = right_query if isinstance(right_query, CTE) else right_query.cte()
+        left_cte = _ensure_cte(left_query)
+        right_cte = _ensure_cte(right_query)
 
         # Build var_to_column from both sides (left takes precedence for common cols)
         var_to_column = {**right_cte.c, **left_cte.c}
@@ -747,8 +756,8 @@ class AlgebraTranslator:
     def _translate_union(self, union: CompValue):
         """Translate a Union operation (SPARQL UNION -> SQL UNION ALL)."""
         left_q, right_q = (self._translate_pattern(union[k]) for k in ("p1", "p2"))
-        left_cte = left_q if isinstance(left_q, CTE) else left_q.cte()
-        right_cte = right_q if isinstance(right_q, CTE) else right_q.cte()
+        left_cte = _ensure_cte(left_q)
+        right_cte = _ensure_cte(right_q)
 
         all_cols = sorted(_get_column_names(left_q) | _get_column_names(right_q))
 
@@ -762,6 +771,33 @@ class AlgebraTranslator:
             ).select_from(cte)
 
         return padded_select(left_cte).union_all(padded_select(right_cte))
+
+    def _translate_group(self, group: CompValue):
+        """Translate a Group operation"""
+        return self._translate_pattern(group["p"])
+
+    def _translate_aggregate_join(self, agg_join: CompValue):
+        """Translate an AggregateJoin (GROUP BY with aggregates).
+
+        AggregateJoin outputs only aggregate result variables
+        Grouping columns are recreated by outer Extend operations.
+        """
+        inner_query = self._translate_pattern(agg_join["p"])
+        cte = _ensure_cte(inner_query)
+        var_to_column = _get_var_to_column(cte)
+
+        # Grouping variables determine GROUP BY clause
+        group_vars = getattr(agg_join["p"], "expr", None) or []
+        group_cols = [cte.c[str(v)] for v in group_vars if str(v) in var_to_column]
+
+        # Output only aggregate result columns
+        agg_cols = [
+            self._translate_expr(agg, var_to_column).label(str(agg.res))
+            for agg in agg_join["A"]
+        ]
+
+        result_query = select(*agg_cols).select_from(cte)
+        return result_query.group_by(*group_cols) if group_cols else result_query
 
     # ---------- Expression Translation ----------
 
@@ -815,8 +851,8 @@ class AlgebraTranslator:
             return self._translate_in_expression(expr, var_to_column)
         if name.startswith("Builtin_"):
             return self._translate_builtin(expr, var_to_column)
-        if name == "Aggregate":
-            return self._translate_aggregate(expr, var_to_column)
+        if name.startswith("Aggregate_"):
+            return self._translate_aggregate_expr(expr, var_to_column)
 
         raise NotImplementedError(f"Expression kind {name!r} not implemented")
 
@@ -1083,47 +1119,30 @@ class AlgebraTranslator:
             result = result.concat(arg)
         return result
 
-    def _translate_aggregate(self, expr, var_to_column):
-        """Translate aggregate expressions (COUNT, SUM, AVG, etc.)."""
-        agg_name = expr.AggFunc.upper()
-        agg_vars = getattr(expr, "vars", None)
-        arg = (
-            self._translate_expr(agg_vars[0], var_to_column) if agg_vars else literal(1)
-        )
-        distinct = getattr(expr, "distinct", False)
+    def _translate_aggregate_expr(self, expr, var_to_column):
+        """Translate Aggregate_* expressions (COUNT, SUM, AVG etc)."""
+        agg_var = getattr(expr, "vars", None)
+        arg = self._translate_expr(agg_var, var_to_column) if agg_var else literal(1)
+        distinct = bool(getattr(expr, "distinct", None))
 
-        # COUNT has special handling for distinct
-        if agg_name == "COUNT":
-            return func.count(arg.distinct()) if distinct else func.count(arg)
+        if expr.name in _AGG_FUNCS:
+            return _AGG_FUNCS[expr.name](arg.distinct() if distinct else arg)
 
-        # Simple aggregate functions
-        if agg_name in _AGG_FUNCS:
-            f = _AGG_FUNCS[agg_name]
-            return f(arg.distinct() if distinct else arg)
+        if expr.name == "Aggregate_Group_Concat":
+            sep = getattr(expr, "separator", ",")
+            dialect_funcs = {
+                "sqlite": func.group_concat,
+                "postgresql": func.string_agg,
+                "databricks": func.string_agg,
+            }
+            f = dialect_funcs.get(self.engine.dialect.name)
+            if not f:
+                raise NotImplementedError(
+                    f"GROUP_CONCAT not supported for {self.engine.dialect.name}"
+                )
+            return f(arg.distinct(), sep) if distinct else f(arg, sep)
 
-        # SAMPLE falls back to MIN with warning
-        if agg_name == "SAMPLE":
-            return func.min(arg.distinct() if distinct else arg)
-
-        # GROUP_CONCAT is dialect-specific
-        if agg_name == "GROUP_CONCAT":
-            return self._translate_group_concat(arg, expr, distinct)
-
-        raise NotImplementedError(f"Aggregate {agg_name!r} not implemented")
-
-    def _translate_group_concat(self, arg, expr, distinct):
-        """Translate GROUP_CONCAT with dialect-specific handling."""
-        dialect = self.engine.dialect.name
-        if dialect == "sqlite":
-            f = func.group_concat
-        elif dialect in ("postgresql", "databricks"):
-            f = func.string_agg
-        else:
-            raise NotImplementedError(
-                f"GROUP_CONCAT aggregate is not supported for dialect {dialect}"
-            )
-        sep = getattr(expr, "separator", ",")
-        return f(arg.distinct(), sep) if distinct else f(arg, sep)
+        raise NotImplementedError(f"Aggregate {expr.name!r} not implemented")
 
 
 # Example usage

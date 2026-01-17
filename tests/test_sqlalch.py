@@ -1170,6 +1170,207 @@ class TestValueEqualityAndSameTerm(unittest.TestCase):
         self.assertNotIn("d", subjects)
 
 
+class TestGroupByAndAggregates(unittest.TestCase):
+    """Tests for GROUP BY and aggregate functions."""
+
+    def setUp(self):
+        """Set up test fixtures with sample data for aggregation tests."""
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = AlgebraTranslator(
+            self.engine, table_name="triples", create_table=True
+        )
+
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    # People with departments and salaries
+                    {
+                        "s": "http://ex.org/alice",
+                        "p": "http://ex.org/dept",
+                        "o": "Engineering",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://ex.org/alice",
+                        "p": "http://ex.org/salary",
+                        "o": "100",
+                        "ot": str(XSD.integer),
+                    },
+                    {
+                        "s": "http://ex.org/bob",
+                        "p": "http://ex.org/dept",
+                        "o": "Engineering",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://ex.org/bob",
+                        "p": "http://ex.org/salary",
+                        "o": "120",
+                        "ot": str(XSD.integer),
+                    },
+                    {
+                        "s": "http://ex.org/charlie",
+                        "p": "http://ex.org/dept",
+                        "o": "Sales",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://ex.org/charlie",
+                        "p": "http://ex.org/salary",
+                        "o": "80",
+                        "ot": str(XSD.integer),
+                    },
+                    {
+                        "s": "http://ex.org/diana",
+                        "p": "http://ex.org/dept",
+                        "o": "Sales",
+                        "ot": str(XSD.string),
+                    },
+                    {
+                        "s": "http://ex.org/diana",
+                        "p": "http://ex.org/salary",
+                        "o": "90",
+                        "ot": str(XSD.integer),
+                    },
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_translate_group_by_count(self):
+        """Test translation of GROUP BY with COUNT produces valid SQL."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (COUNT(?person) AS ?count)
+        WHERE { ?person ex:dept ?dept }
+        GROUP BY ?dept
+        """
+        _, sql_query = self.translator.translate(query)
+        self.assertIsInstance(sql_query, Select)
+
+        # Verify query compiles without error
+        compiled = sql_query.compile()
+        self.assertIsNotNone(compiled)
+
+    def test_execute_group_by_count(self):
+        """Test GROUP BY with COUNT returns correct counts per group."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (COUNT(?person) AS ?count)
+        WHERE { ?person ex:dept ?dept }
+        GROUP BY ?dept
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # Convert to dict for easier checking
+        counts = {row.dept: int(row.count) for row in rows}
+
+        self.assertEqual(counts["Engineering"], 2)
+        self.assertEqual(counts["Sales"], 2)
+
+    def test_execute_group_by_sum(self):
+        """Test GROUP BY with SUM returns correct totals per group."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (SUM(?salary) AS ?total)
+        WHERE {
+            ?person ex:dept ?dept .
+            ?person ex:salary ?salary .
+        }
+        GROUP BY ?dept
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        totals = {row.dept: float(row.total) for row in rows}
+
+        # Engineering: 100 + 120 = 220
+        self.assertEqual(totals["Engineering"], 220.0)
+        # Sales: 80 + 90 = 170
+        self.assertEqual(totals["Sales"], 170.0)
+
+    def test_execute_group_by_avg(self):
+        """Test GROUP BY with AVG returns correct averages per group."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (AVG(?salary) AS ?avg)
+        WHERE {
+            ?person ex:dept ?dept .
+            ?person ex:salary ?salary .
+        }
+        GROUP BY ?dept
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        avgs = {row.dept: float(row.avg) for row in rows}
+
+        # Engineering: (100 + 120) / 2 = 110
+        self.assertEqual(avgs["Engineering"], 110.0)
+        # Sales: (80 + 90) / 2 = 85
+        self.assertEqual(avgs["Sales"], 85.0)
+
+    def test_execute_group_by_min_max(self):
+        """Test GROUP BY with MIN and MAX returns correct values."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (MIN(?salary) AS ?min_sal) (MAX(?salary) AS ?max_sal)
+        WHERE {
+            ?person ex:dept ?dept .
+            ?person ex:salary ?salary .
+        }
+        GROUP BY ?dept
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        results = {row.dept: (row.min_sal, row.max_sal) for row in rows}
+
+        # Engineering: min=100, max=120
+        self.assertEqual(results["Engineering"], ("100", "120"))
+        # Sales: min=80, max=90
+        self.assertEqual(results["Sales"], ("80", "90"))
+
+    def test_execute_aggregate_without_group_by(self):
+        """Test aggregate over entire result set (no GROUP BY)."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT (COUNT(?person) AS ?total)
+        WHERE { ?person ex:dept ?dept }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(int(rows[0].total), 4)
+
+    def test_execute_group_by_multiple_aggregates(self):
+        """Test GROUP BY with multiple aggregate functions."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?dept (COUNT(?person) AS ?count) (SUM(?salary) AS ?total) (AVG(?salary) AS ?avg)
+        WHERE {
+            ?person ex:dept ?dept .
+            ?person ex:salary ?salary .
+        }
+        GROUP BY ?dept
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        results = {
+            row.dept: (int(row.count), float(row.total), float(row.avg)) for row in rows
+        }
+
+        self.assertEqual(results["Engineering"], (2, 220.0, 110.0))
+        self.assertEqual(results["Sales"], (2, 170.0, 85.0))
+
+
 class TestValueEqualityWithLiterals(unittest.TestCase):
     """Tests for value equality with literal values in FILTER expressions."""
 
