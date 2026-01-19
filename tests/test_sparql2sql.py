@@ -1,7 +1,7 @@
 """Tests for the sparql2sql module.
 
-These tests mirror test_sqlalch.py to verify the new implementation
-has feature parity with the original.
+Most testing is performed by the W3C tests, but these are
+small sanity checks of the implementation.
 """
 
 import unittest
