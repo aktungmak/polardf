@@ -200,23 +200,39 @@ def _add_object_type_condition(conditions: list, ot_column, o_type: Optional[str
 
 
 class AlgebraTranslator:
-    """Translates SPARQL algebra expressions to SQLAlchemy queries."""
+    """Translates SPARQL algebra expressions to SQLAlchemy queries.
+    The table name specified is treated as a SPARQL Dataset, which
+    contains a default graph and if the graph_aware parameter is true,
+    zero or more named graphs.
+    """
 
     def __init__(
-        self, engine: Engine, table_name: str = "triples", create_table: bool = False
+        self,
+        engine: Engine,
+        table_name: str = "triples",
+        create_table: bool = False,
+        graph_aware: bool = False,
     ):
         self.engine = engine
         self.metadata = MetaData()
         self._cte_counter = itertools.count()
+        self.graph_aware = graph_aware
 
-        self.table = Table(
-            quoted_name(table_name, quote=False),
-            self.metadata,
+        columns = [
             Column("s", String, nullable=False, primary_key=True),
             Column("p", String, nullable=False, primary_key=True),
             Column("o", String, nullable=False, primary_key=True),
             # ot contains the type of the o column - NULL means IRI or blank node
             Column("ot", String, nullable=True, primary_key=True),
+        ]
+        if graph_aware:
+            # g column: NULL = default graph, non-NULL = named graph URI
+            columns.append(Column("g", String, nullable=True, primary_key=True))
+
+        self.table = Table(
+            quoted_name(table_name, quote=False),
+            self.metadata,
+            *columns,
         )
 
         # TODO create a symbol table alterantive like this
@@ -288,37 +304,26 @@ class AlgebraTranslator:
 
     def _translate_pattern(self, pattern):
         """Translate different pattern types."""
-        if hasattr(pattern, "name"):
-            if pattern.name == "BGP":
-                return self._translate_bgp(pattern)
-            elif pattern.name == "Project":
-                return self._translate_project(pattern)
-            elif pattern.name == "LeftJoin":
-                return self._translate_left_join(pattern)
-            elif pattern.name == "Distinct":
-                return self._translate_distinct(pattern)
-            elif pattern.name == "Extend":
-                return self._translate_extend(pattern)
-            elif pattern.name == "Filter":
-                return self._translate_filter(pattern)
-            elif pattern.name == "OrderBy":
-                return self._translate_order_by(pattern)
-            elif pattern.name == "Join":
-                return self._translate_join(pattern)
-            elif pattern.name == "Slice":
-                return self._translate_slice(pattern)
-            elif pattern.name == "Union":
-                return self._translate_union(pattern)
-            elif pattern.name == "Group":
-                return self._translate_group(pattern)
-            elif pattern.name == "AggregateJoin":
-                return self._translate_aggregate_join(pattern)
-            else:
-                raise NotImplementedError(
-                    f"Pattern type {pattern.name} not implemented"
-                )
-        else:
+        dispatch = {
+            "BGP": self._translate_bgp,
+            "Project": self._translate_project,
+            "LeftJoin": self._translate_left_join,
+            "Distinct": self._translate_distinct,
+            "Extend": self._translate_extend,
+            "Filter": self._translate_filter,
+            "OrderBy": self._translate_order_by,
+            "Join": self._translate_join,
+            "Slice": self._translate_slice,
+            "Union": self._translate_union,
+            "Group": self._translate_group,
+            "AggregateJoin": self._translate_aggregate_join,
+            "Graph": self._translate_graph,
+        }
+        if not hasattr(pattern, "name"):
             raise ValueError(f"Unknown pattern type: {pattern}")
+        if pattern.name not in dispatch:
+            raise NotImplementedError(f"Pattern type {pattern.name} not implemented")
+        return dispatch[pattern.name](pattern)
 
     def _translate_bgp(self, bgp: CompValue) -> Union[Select, CTE]:
         """Translate a Basic Graph Pattern to a query."""
@@ -329,10 +334,7 @@ class AlgebraTranslator:
         if not triples:
             return select(column("1"))
 
-        queries = []
-        for triple in triples:
-            queries.extend(self._expand_triple(triple))
-
+        queries = [q for triple in triples for q in self._expand_triple(triple)]
         return self._join_queries(queries)
 
     def _expand_triple(self, triple: tuple) -> List[Select]:
@@ -348,28 +350,20 @@ class AlgebraTranslator:
         if not isinstance(p, Path):
             return [self._triple_to_query(triple)]
 
-        # SequencePath (e.g. :a/:b/:c)
-        elif isinstance(p, SequencePath):
+        if isinstance(p, SequencePath):
             temp_vars = [Variable(f"_path_{id(p)}_{i}") for i in range(len(p.args) - 1)]
-            subjects = [s] + temp_vars
-            predicates = p.args
-            objects = temp_vars + [o]
-            expanded_triples = list(zip(subjects, predicates, objects))
-            return [self._triple_to_query(t) for t in expanded_triples]
+            expanded = zip([s] + temp_vars, p.args, temp_vars + [o])
+            return [self._triple_to_query(t) for t in expanded]
 
-        # MulPath (e.g. :a*)
-        elif isinstance(p, MulPath):
+        if isinstance(p, MulPath):
             return [self._mulpath_to_cte(s, p, o)]
-        else:
-            raise NotImplementedError(f"Path type {type(p)} not implemented")
+
+        raise NotImplementedError(f"Path type {type(p)} not implemented")
 
     def _triple_to_query(self, triple: tuple) -> Select:
         """Convert a single, expanded triple pattern to a query."""
         s, p, o = triple
-
-        # Collect SELECT columns and WHERE conditions
-        columns = []
-        conditions = []
+        columns, conditions = [], []
 
         # Subject
         if isinstance(s, Variable):
@@ -385,7 +379,7 @@ class AlgebraTranslator:
 
         # Predicate
         if isinstance(p, Variable):
-            if p == s:  # Same variable as subject
+            if p == s:
                 conditions.append(self.table.c.p == self.table.c.s)
             else:
                 columns.append(self.table.c.p.label(str(p)))
@@ -399,23 +393,23 @@ class AlgebraTranslator:
 
         # Object
         if isinstance(o, Variable):
-            if o == s:  # Same variable as subject
+            if o == s:
                 conditions.append(self.table.c.o == self.table.c.s)
                 _add_object_type_condition(conditions, self.table.c.ot, None)
-            elif o == p:  # Same variable as predicate
+            elif o == p:
                 conditions.append(self.table.c.o == self.table.c.p)
                 _add_object_type_condition(conditions, self.table.c.ot, None)
             else:
                 columns.append(self.table.c.o.label(str(o)))
-                # Also select the ot column for type information (needed for value equality)
                 columns.append(self.table.c.ot.label(f"_ot_{o}"))
         elif isinstance(o, BNode):
             # TODO this is also potentially incorrect
             columns.append(self.table.c.o.label(f"_bnode_{o}"))
         elif (o_str := term_to_string(o)) is not None:
             conditions.append(self.table.c.o == o_str)
-            o_type = term_to_object_type(o)
-            _add_object_type_condition(conditions, self.table.c.ot, o_type)
+            _add_object_type_condition(
+                conditions, self.table.c.ot, term_to_object_type(o)
+            )
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
 
@@ -443,9 +437,7 @@ class AlgebraTranslator:
                 f"MulPath with path type {type(mulpath.path)} not implemented"
             )
 
-        # Convert bound values to strings for comparison
-        s_value = term_to_string(s)
-        o_value = term_to_string(o)
+        s_value, o_value = term_to_string(s), term_to_string(o)
         o_type = term_to_object_type(o) if not isinstance(o, Variable) else None
 
         # Base case: all direct edges with the predicate (need s, o, and ot for type filtering)
@@ -542,10 +534,8 @@ class AlgebraTranslator:
         """Translate a Project (SELECT) operation."""
         assert project.name == "Project"
         project_vars = project["PV"]
-        pattern = project["p"]
 
-        # Translate the inner pattern
-        base_query = self._translate_pattern(pattern)
+        base_query = self._translate_pattern(project["p"])
         base_cols = _get_column_names(base_query)
         project_var_names = set(str(var) for var in project_vars)
 
@@ -555,9 +545,14 @@ class AlgebraTranslator:
 
         # Handle empty projections (e.g. when all terms are bound)
         if len(project_vars) == 0:
-            # For empty projections, return base query as-is
-            # This allows MulPath queries with bound endpoints to still work
-            return base_query
+            # Empty projection means no user-visible columns, but rows still matter
+            # Use a dummy internal column for SQL validity - will be filtered by caller
+            if isinstance(base_query, CTE):
+                return select(literal(1).label("__placeholder__")).select_from(
+                    base_query
+                )
+            else:
+                return base_query.with_only_columns(literal(1).label("__placeholder__"))
 
         # Build projection columns
         # - Variables that exist in base query: select from the query's columns
@@ -692,7 +687,6 @@ class AlgebraTranslator:
         assert slice_.name == "Slice"
         start = getattr(slice_, "start", 0)
         length = getattr(slice_, "length", None)
-
         inner_query = self._translate_pattern(slice_["p"])
 
         # If it's a CTE, we need to select from it first
@@ -810,6 +804,20 @@ class AlgebraTranslator:
 
         result_query = select(*agg_cols).select_from(cte)
         return result_query.group_by(*group_cols) if group_cols else result_query
+
+    def _translate_graph(self, graph: CompValue):
+        """Translate a GRAPH pattern.
+
+        Structure: Graph(term=graph_name, p=inner_pattern)
+        where term is either a Variable (GRAPH ?g {...}) or URIRef (GRAPH <uri> {...})
+        """
+        assert graph.name == "Graph"
+
+        if not self.graph_aware:
+            raise ValueError("Graph patterns require graph_aware=True")
+
+        # TODO implement this
+        raise NotImplementedError("Graph patterns not implemented yet")
 
     # ---------- Expression Translation ----------
 

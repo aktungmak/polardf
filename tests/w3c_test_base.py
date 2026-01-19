@@ -648,8 +648,14 @@ def create_test_method(test_case: W3CTestCase):
 
         # Convert actual results to comparable format
         # Use result.keys() to get column names (works even with empty results)
-        actual_vars = list(result.keys())
-        actual_bindings = [dict(zip(actual_vars, row)) for row in actual_rows]
+        # Filter out internal columns (starting with _) - these are implementation details
+        all_vars = list(result.keys())
+        actual_vars = [v for v in all_vars if not v.startswith("_")]
+        # Build bindings with only user-visible variables
+        actual_bindings = [
+            {v: row[i] for i, v in enumerate(all_vars) if not v.startswith("_")}
+            for row in actual_rows
+        ]
 
         # Compare results
         is_eq, reason = results_equivalent(
@@ -677,8 +683,10 @@ class W3CSparqlTestBase(unittest.TestCase):
         """Set up class-level resources."""
         # Create in-memory SQLite database
         cls.engine = create_engine("sqlite:///:memory:")
+        # Use graph_aware=True to support GRAPH patterns in tests
+        # Non-graph queries still work
         cls.translator = AlgebraTranslator(
-            cls.engine, table_name="triples", create_table=True
+            cls.engine, table_name="triples", create_table=True, graph_aware=True
         )
 
     @classmethod
@@ -695,24 +703,28 @@ class W3CSparqlTestBase(unittest.TestCase):
 
     def _load_test_data(self, test_case: W3CTestCase):
         """Load test data into the database."""
-        # Load default graph data
+        # Load default graph data (graph_name=None for default graph)
         for data_url in test_case.data_urls:
             g = load_graph(data_url)
-            self._load_graph_to_db(g)
+            self._load_graph_to_db(g, graph_name=None)
 
-        # Note: Named graphs are not fully supported in our simple triple store model
-        # For now, we merge named graph data into the default graph
+        # Load named graphs with their graph names
         for name, url in test_case.graph_data:
             g = load_graph(url)
-            self._load_graph_to_db(g)
+            self._load_graph_to_db(g, graph_name=name)
 
-    def _load_graph_to_db(self, g: Graph):
+    def _load_graph_to_db(self, g: Graph, graph_name: Optional[str] = None):
         """Load an rdflib Graph into the database.
 
         Storage format matches the AlgebraTranslator's expectations:
         - URIs: stored as raw URI strings (no angle brackets)
         - Literals: lexical value in 'o', type info in 'ot'
         - BNodes: _:id format
+        - Graph name: stored in 'g' column (None for default graph)
+
+        Args:
+            g: The rdflib Graph to load
+            graph_name: The named graph URI (None for default graph)
         """
         triples = []
         for s, p, o in g:
@@ -724,7 +736,13 @@ class W3CSparqlTestBase(unittest.TestCase):
             o_str = term_to_string(o) or str(o)
             ot_str = term_to_object_type(o)
 
-            triples.append({"s": s_str, "p": p_str, "o": o_str, "ot": ot_str})
+            row = {"s": s_str, "p": p_str, "o": o_str, "ot": ot_str}
+
+            # Add graph column if translator is graph-aware
+            if self.translator.graph_aware:
+                row["g"] = graph_name
+
+            triples.append(row)
 
         if triples:
             with self.engine.connect() as conn:
