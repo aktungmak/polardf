@@ -2,7 +2,7 @@
 Shared infrastructure for W3C SPARQL test suites.
 
 This module provides common functionality for running W3C SPARQL evaluation tests
-against the AlgebraTranslator implementation. It supports both SPARQL 1.0 and 1.1
+against the Translator implementation. It supports both SPARQL 1.0 and 1.1
 test suites.
 
 Test suite sources:
@@ -25,7 +25,7 @@ from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
 from sqlalchemy import create_engine
 
-from rdfdf.sqlalch import AlgebraTranslator, term_to_string, term_to_object_type
+from rdfdf.sparql2sql import Translator, term_to_string, term_to_object_type
 
 
 # Disable rdflib's literal normalisation to preserve original lexical forms.
@@ -685,7 +685,7 @@ class W3CSparqlTestBase(unittest.TestCase):
         cls.engine = create_engine("sqlite:///:memory:")
         # Use graph_aware=True to support GRAPH patterns in tests
         # Non-graph queries still work
-        cls.translator = AlgebraTranslator(
+        cls.translator = Translator(
             cls.engine, table_name="triples", create_table=True, graph_aware=True
         )
 
@@ -716,7 +716,7 @@ class W3CSparqlTestBase(unittest.TestCase):
     def _load_graph_to_db(self, g: Graph, graph_name: Optional[str] = None):
         """Load an rdflib Graph into the database.
 
-        Storage format matches the AlgebraTranslator's expectations:
+        Storage format matches the Translator's expectations:
         - URIs: stored as raw URI strings (no angle brackets)
         - Literals: lexical value in 'o', type info in 'ot'
         - BNodes: _:id format

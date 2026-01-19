@@ -1,8 +1,8 @@
 """
-W3C SPARQL 1.1 Evaluation Test Suite for sqlalch.py
+W3C SPARQL 1.1 Evaluation Test Suite for sparql2sql.py
 
 This module runs the W3C SPARQL 1.1 evaluation test cases against the
-AlgebraTranslator implementation to verify conformance with the SPARQL 1.1 spec.
+Translator implementation to verify conformance with the SPARQL 1.1 spec.
 
 Test suite source: https://www.w3.org/2009/sparql/docs/tests/data-sparql11/
 Manifest: https://www.w3.org/2009/sparql/docs/tests/data-sparql11/manifest-all.ttl
