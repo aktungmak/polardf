@@ -1,4 +1,5 @@
 import itertools
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, URIRef, XSD
@@ -217,6 +218,7 @@ class AlgebraTranslator:
         self.metadata = MetaData()
         self._cte_counter = itertools.count()
         self.graph_aware = graph_aware
+        self._graph_term = None  # Current GRAPH context (Variable or URIRef)
 
         columns = [
             Column("s", String, nullable=False, primary_key=True),
@@ -235,11 +237,31 @@ class AlgebraTranslator:
             *columns,
         )
 
-        # TODO create a symbol table alterantive like this
+        # TODO create a symbol table alternative like this
         # SELECT t.* FROM t INNER JOIN s s1 ON t.s = s1.i AND s1.t = "one" INNER JOIN s s2 ON t.o = s2.i AND s2.t = "three";
 
         if create_table:
             self.metadata.create_all(self.engine)
+
+    @contextmanager
+    def _in_graph(self, term):
+        """Context manager for GRAPH pattern translation."""
+        old, self._graph_term = self._graph_term, term
+        try:
+            yield
+        finally:
+            self._graph_term = old
+
+    def _graph_filter(self):
+        """Return WHERE condition for current graph context, or None."""
+        if not self.graph_aware:
+            return None
+        if self._graph_term is None:
+            return self.table.c.g.is_(None)
+        elif isinstance(self._graph_term, Variable):
+            return self.table.c.g.isnot(None)
+        else:
+            return self.table.c.g == str(self._graph_term)
 
     # ---------- Execution & Translation API ----------
 
@@ -329,10 +351,32 @@ class AlgebraTranslator:
         """Translate a Basic Graph Pattern to a query."""
         assert bgp.name == "BGP"
         triples = bgp["triples"]
-
-        # Empty BGP = single solution with no bindings = SELECT 1
+        # Empty BGP handling depends on graph context
         if not triples:
-            return select(column("1"))
+            if self._graph_term is None:
+                if not self.graph_aware:
+                    # No graph support: single solution with no bindings
+                    return select(column("1"))
+                # Standard SPARQL: empty BGP in default graph = single solution if default graph exists
+                return (
+                    select(literal(1).label("_exists_"))
+                    .where(self.table.c.g.is_(None))
+                    .limit(1)
+                )
+            elif isinstance(self._graph_term, Variable):
+                # GRAPH ?g {}: list all distinct named graph URIs
+                return (
+                    select(self.table.c.g.label(str(self._graph_term)))
+                    .where(self.table.c.g.isnot(None))
+                    .distinct()
+                )
+            else:
+                # GRAPH <uri> {}: single row if graph exists, empty otherwise
+                return (
+                    select(literal(1).label("_exists_"))
+                    .where(self.table.c.g == str(self._graph_term))
+                    .limit(1)
+                )
 
         queries = [q for triple in triples for q in self._expand_triple(triple)]
         return self._join_queries(queries)
@@ -364,10 +408,17 @@ class AlgebraTranslator:
         """Convert a single, expanded triple pattern to a query."""
         s, p, o = triple
         columns, conditions = [], []
+        # Check if graph variable is used in the triple pattern
+        # If so, we join on g column instead of selecting separately
+        graph_var = self._graph_term if isinstance(self._graph_term, Variable) else None
 
         # Subject
         if isinstance(s, Variable):
-            columns.append(self.table.c.s.label(str(s)))
+            if graph_var and s == graph_var:
+                # Graph variable used as subject: join s = g
+                conditions.append(self.table.c.s == self.table.c.g)
+            else:
+                columns.append(self.table.c.s.label(str(s)))
         elif isinstance(s, BNode):
             # Treat as unnamed variable with internal label
             # TODO this is wrong I think... it should be matching on bnodes?
@@ -381,6 +432,8 @@ class AlgebraTranslator:
         if isinstance(p, Variable):
             if p == s:
                 conditions.append(self.table.c.p == self.table.c.s)
+            elif graph_var and p == graph_var:
+                conditions.append(self.table.c.p == self.table.c.g)
             else:
                 columns.append(self.table.c.p.label(str(p)))
         elif isinstance(p, BNode):
@@ -399,8 +452,12 @@ class AlgebraTranslator:
             elif o == p:
                 conditions.append(self.table.c.o == self.table.c.p)
                 _add_object_type_condition(conditions, self.table.c.ot, None)
+            elif graph_var and o == graph_var:
+                conditions.append(self.table.c.o == self.table.c.g)
+                _add_object_type_condition(conditions, self.table.c.ot, None)
             else:
                 columns.append(self.table.c.o.label(str(o)))
+                # Also select the ot column for type information (needed for value equality)
                 columns.append(self.table.c.ot.label(f"_ot_{o}"))
         elif isinstance(o, BNode):
             # TODO this is also potentially incorrect
@@ -412,6 +469,13 @@ class AlgebraTranslator:
             )
         else:
             raise NotImplementedError(f"Object type {type(o)} not implemented")
+
+        # Graph context handling (standard SPARQL semantics)
+        if (g_filter := self._graph_filter()) is not None:
+            conditions.append(g_filter)
+            # For GRAPH ?var, also bind the graph column
+            if isinstance(self._graph_term, Variable):
+                columns.append(self.table.c.g.label(str(self._graph_term)))
 
         # If no variables to select, we still need a valid SELECT clause
         # This happens when all triple positions are bound (an existence check)
@@ -428,6 +492,7 @@ class AlgebraTranslator:
         """Generate a recursive CTE for MulPath evaluation.
 
         Generates a transitive closure query, optionally filtered by bound endpoints.
+        Respects graph context from enclosing GRAPH patterns.
         """
         # Get the predicate to follow
         # TODO handle the case when this is a nested path (see 1.1 test pp02)
@@ -439,25 +504,43 @@ class AlgebraTranslator:
 
         s_value, o_value = term_to_string(s), term_to_string(o)
         o_type = term_to_object_type(o) if not isinstance(o, Variable) else None
+        # Build base conditions for predicate matching
+        base_conditions = [self.table.c.p == pred_value]
+        if (g_filter := self._graph_filter()) is not None:
+            base_conditions.append(g_filter)
 
-        # Base case: all direct edges with the predicate (need s, o, and ot for type filtering)
-        base_query = select(self.table.c.s, self.table.c.o, self.table.c.ot).where(
-            self.table.c.p == pred_value
-        )
+        # Base case: all direct edges with the predicate (need s, o, ot, and optionally g)
+        base_cols = [self.table.c.s, self.table.c.o, self.table.c.ot]
+        if isinstance(self._graph_term, Variable):
+            base_cols.append(self.table.c.g)
+
+        base_query = select(*base_cols).where(and_(*base_conditions))
 
         # Create recursive CTE with unique name
         cte_name = f"path_cte_{next(self._cte_counter)}"
         path_cte = base_query.cte(name=cte_name, recursive=True)
 
+        # Recursive conditions
+        recursive_conditions = [self.table.c.p == pred_value]
+        if self.graph_aware:
+            if self._graph_term is None:
+                # No GRAPH clause: stay in default graph
+                recursive_conditions.append(self.table.c.g.is_(None))
+            elif isinstance(self._graph_term, Variable):
+                # Within same graph for variable: match on g column
+                recursive_conditions.append(self.table.c.g == path_cte.c.g)
+            else:
+                recursive_conditions.append(self.table.c.g == str(self._graph_term))
+
         # Recursive case: extend paths forward
+        recursive_cols = [path_cte.c.s, self.table.c.o, self.table.c.ot]
+        if isinstance(self._graph_term, Variable):
+            recursive_cols.append(path_cte.c.g)
+
         recursive_query = (
-            select(
-                path_cte.c.s,  # Keep original starting node
-                self.table.c.o,  # Extend to new destinations
-                self.table.c.ot,  # Carry forward object type
-            )
+            select(*recursive_cols)
             .select_from(path_cte.join(self.table, path_cte.c.o == self.table.c.s))
-            .where(self.table.c.p == pred_value)
+            .where(and_(*recursive_conditions))
         )
 
         # Union base and recursive parts
@@ -469,6 +552,8 @@ class AlgebraTranslator:
             result_columns.append(path_cte.c.s.label(str(s)))
         if isinstance(o, Variable):
             result_columns.append(path_cte.c.o.label(str(o)))
+        if isinstance(self._graph_term, Variable):
+            result_columns.append(path_cte.c.g.label(str(self._graph_term)))
 
         # If no variables, still need to select something for filtering
         if not result_columns:
@@ -810,14 +895,17 @@ class AlgebraTranslator:
 
         Structure: Graph(term=graph_name, p=inner_pattern)
         where term is either a Variable (GRAPH ?g {...}) or URIRef (GRAPH <uri> {...})
+
+        For variable graphs, filters to named graphs only (g IS NOT NULL) and
+        binds g to the variable. For URI graphs, filters to that specific graph.
         """
         assert graph.name == "Graph"
 
         if not self.graph_aware:
             raise ValueError("Graph patterns require graph_aware=True")
 
-        # TODO implement this
-        raise NotImplementedError("Graph patterns not implemented yet")
+        with self._in_graph(graph["term"]):
+            return self._translate_pattern(graph["p"])
 
     # ---------- Expression Translation ----------
 
