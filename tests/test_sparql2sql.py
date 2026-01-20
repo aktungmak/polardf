@@ -633,5 +633,188 @@ class TestGraphPatterns(unittest.TestCase):
         )
 
 
+class TestEffectiveBooleanValue(unittest.TestCase):
+    """Tests for Effective Boolean Value (EBV) semantics per SPARQL 17.2.2."""
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = Translator(
+            self.engine, table_name="triples", create_table=True
+        )
+
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    # Boolean values
+                    {"s": "http://ex.org/b1", "p": "http://ex.org/val", "o": "true", "ot": str(XSD.boolean)},
+                    {"s": "http://ex.org/b2", "p": "http://ex.org/val", "o": "false", "ot": str(XSD.boolean)},
+                    # String values
+                    {"s": "http://ex.org/s1", "p": "http://ex.org/val", "o": "hello", "ot": str(XSD.string)},
+                    {"s": "http://ex.org/s2", "p": "http://ex.org/val", "o": "", "ot": str(XSD.string)},
+                    # Plain literals (no datatype)
+                    {"s": "http://ex.org/p1", "p": "http://ex.org/val", "o": "plain", "ot": None},
+                    {"s": "http://ex.org/p2", "p": "http://ex.org/val", "o": "", "ot": None},
+                    # Numeric values
+                    {"s": "http://ex.org/n1", "p": "http://ex.org/val", "o": "42", "ot": str(XSD.integer)},
+                    {"s": "http://ex.org/n2", "p": "http://ex.org/val", "o": "0", "ot": str(XSD.integer)},
+                    {"s": "http://ex.org/n3", "p": "http://ex.org/val", "o": "3.14", "ot": str(XSD.decimal)},
+                    {"s": "http://ex.org/n4", "p": "http://ex.org/val", "o": "0.0", "ot": str(XSD.decimal)},
+                    # Unknown datatype (should be type error)
+                    {"s": "http://ex.org/u1", "p": "http://ex.org/val", "o": "2024-01-01", "ot": str(XSD.date)},
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_ebv_boolean_true(self):
+        """EBV of xsd:boolean 'true' is true."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertIn("http://ex.org/b1", subjects)
+
+    def test_ebv_boolean_false(self):
+        """EBV of xsd:boolean 'false' is false."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertNotIn("http://ex.org/b2", subjects)
+
+    def test_ebv_string_nonempty(self):
+        """EBV of non-empty xsd:string is true."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertIn("http://ex.org/s1", subjects)
+
+    def test_ebv_string_empty(self):
+        """EBV of empty xsd:string is false."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertNotIn("http://ex.org/s2", subjects)
+
+    def test_ebv_plain_literal_nonempty(self):
+        """EBV of non-empty plain literal is true."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertIn("http://ex.org/p1", subjects)
+
+    def test_ebv_plain_literal_empty(self):
+        """EBV of empty plain literal is false."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertNotIn("http://ex.org/p2", subjects)
+
+    def test_ebv_numeric_nonzero(self):
+        """EBV of non-zero numeric is true."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertIn("http://ex.org/n1", subjects)
+        self.assertIn("http://ex.org/n3", subjects)
+
+    def test_ebv_numeric_zero(self):
+        """EBV of zero numeric is false."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        self.assertNotIn("http://ex.org/n2", subjects)
+        self.assertNotIn("http://ex.org/n4", subjects)
+
+    def test_ebv_unknown_type_error(self):
+        """EBV of unknown datatype is type error (filters out row)."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        # xsd:date is not a valid EBV type, so u1 should be filtered out
+        self.assertNotIn("http://ex.org/u1", subjects)
+
+    def test_ebv_not_operator(self):
+        """NOT applies EBV then negates."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE { ?s ex:val ?v . FILTER(!?v) }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        # NOT(true EBV) = false, NOT(false EBV) = true
+        self.assertIn("http://ex.org/b2", subjects)  # false boolean
+        self.assertIn("http://ex.org/s2", subjects)  # empty string
+        self.assertIn("http://ex.org/n2", subjects)  # zero integer
+        self.assertNotIn("http://ex.org/b1", subjects)  # true boolean
+        self.assertNotIn("http://ex.org/s1", subjects)  # non-empty string
+
+    def test_ebv_or_operator(self):
+        """OR applies EBV to operands."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE {
+            ?s ex:val ?v .
+            FILTER(?v || false)
+        }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        # true OR false = true for truthy values
+        self.assertIn("http://ex.org/b1", subjects)
+        self.assertIn("http://ex.org/s1", subjects)
+        self.assertIn("http://ex.org/n1", subjects)
+        # false OR false = false for falsy values
+        self.assertNotIn("http://ex.org/b2", subjects)
+        self.assertNotIn("http://ex.org/s2", subjects)
+
+    def test_ebv_and_operator(self):
+        """AND applies EBV to operands."""
+        query = """
+        PREFIX ex: <http://ex.org/>
+        SELECT ?s WHERE {
+            ?s ex:val ?v .
+            FILTER(?v && true)
+        }
+        """
+        result = self.translator.execute(query)
+        subjects = {row.s for row in result.fetchall()}
+        # true AND true = true for truthy values
+        self.assertIn("http://ex.org/b1", subjects)
+        self.assertIn("http://ex.org/s1", subjects)
+        # false AND true = false for falsy values
+        self.assertNotIn("http://ex.org/b2", subjects)
+        self.assertNotIn("http://ex.org/s2", subjects)
+
+
 if __name__ == "__main__":
     unittest.main()

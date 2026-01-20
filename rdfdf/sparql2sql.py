@@ -216,6 +216,55 @@ _NUMERIC_TYPES = {
     str(XSD.positiveInteger),
 }
 
+# =============================================================================
+# Effective Boolean Value (EBV)
+# =============================================================================
+
+# Valid EBV types: numerics, boolean, and string (plus plain literals handled separately)
+_EBV_VALID_TYPES = _NUMERIC_TYPES | {str(XSD.boolean), str(XSD.string)}
+
+
+def _ebv(value_col, type_col):
+    """Compute Effective Boolean Value per SPARQL 17.2.2.
+
+    Returns NULL for type errors (unbound/unsupported), which filters the row.
+    """
+    is_plain = type_col.is_(None)
+    valid_types = [literal(t) for t in _EBV_VALID_TYPES]
+    numeric_types = [literal(t) for t in _NUMERIC_TYPES]
+
+    return case(
+        # Unbound
+        (value_col.is_(None), null()),
+        # Invalid type
+        (not_(or_(is_plain, type_col.in_(valid_types))), null()),
+        # Boolean
+        (type_col == literal(str(XSD.boolean)), value_col == literal("true")),
+        # Numeric
+        (type_col.in_(numeric_types), func.cast(value_col, Float) != literal(0)),
+        # String
+        (
+            or_(is_plain, type_col == literal(str(XSD.string))),
+            func.length(value_col) > literal(0),
+        ),
+        # Unreachable
+        else_=null(),
+    )
+
+
+def _needs_ebv(expr, var_to_col):
+    """Check if an expression is a variable that needs EBV conversion.
+
+    Returns (value_col, type_col) if EBV needed, None otherwise.
+    """
+    if not isinstance(expr, Variable):
+        return None
+    var_name = str(expr)
+    type_col_name = f"_ot_{var_name}"
+    if var_name in var_to_col and type_col_name in var_to_col:
+        return var_to_col[var_name], var_to_col[type_col_name]
+    return None
+
 
 # =============================================================================
 # Expression Translation Registry
@@ -355,26 +404,35 @@ def _value_cmp_with_literal(var_value, var_type, lit_value, lit_type_str, op):
     return and_(var_type == literal(lit_type_str), cmp_op(var_value, lit_value))
 
 
+def _translate_ebv_operand(operand_expr, var_to_col, engine):
+    """Translate an operand applying EBV if it's a variable with type info."""
+    ebv_cols = _needs_ebv(operand_expr, var_to_col)
+    if ebv_cols:
+        value_col, type_col = ebv_cols
+        return _ebv(value_col, type_col)
+    return translate_expr(operand_expr, var_to_col, engine)
+
+
 @expr_handler("ConditionalAndExpression")
 def _expr_and(expr, var_to_col, engine):
-    """Translate && expressions."""
-    operands = [translate_expr(expr.expr, var_to_col, engine)]
-    operands.extend(translate_expr(e, var_to_col, engine) for e in expr.other)
+    """Translate && expressions with EBV semantics."""
+    operands = [_translate_ebv_operand(expr.expr, var_to_col, engine)]
+    operands.extend(_translate_ebv_operand(e, var_to_col, engine) for e in expr.other)
     return and_(*operands)
 
 
 @expr_handler("ConditionalOrExpression")
 def _expr_or(expr, var_to_col, engine):
-    """Translate || expressions."""
-    operands = [translate_expr(expr.expr, var_to_col, engine)]
-    operands.extend(translate_expr(e, var_to_col, engine) for e in expr.other)
+    """Translate || expressions with EBV semantics."""
+    operands = [_translate_ebv_operand(expr.expr, var_to_col, engine)]
+    operands.extend(_translate_ebv_operand(e, var_to_col, engine) for e in expr.other)
     return or_(*operands)
 
 
 @expr_handler("UnaryNot")
 def _expr_not(expr, var_to_col, engine):
-    """Translate ! expressions."""
-    return not_(translate_expr(expr.expr, var_to_col, engine))
+    """Translate ! expressions with EBV semantics."""
+    return not_(_translate_ebv_operand(expr.expr, var_to_col, engine))
 
 
 @expr_handler("AdditiveExpression")
@@ -903,7 +961,14 @@ def _pattern_filter(node: CompValue, ctx: Ctx, engine) -> QueryResult:
         var_to_col = cols(inner_query)
         base_select = inner_query
 
-    sql_condition = translate_expr(node["expr"], var_to_col, engine)
+    # Apply EBV if the filter expression is a bare variable
+    filter_expr = node["expr"]
+    ebv_cols = _needs_ebv(filter_expr, var_to_col)
+    if ebv_cols:
+        value_col, type_col = ebv_cols
+        sql_condition = _ebv(value_col, type_col)
+    else:
+        sql_condition = translate_expr(filter_expr, var_to_col, engine)
     return base_select.where(sql_condition)
 
 
