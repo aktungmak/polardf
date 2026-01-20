@@ -9,7 +9,7 @@ from rdflib import XSD
 from sqlalchemy import create_engine
 from sqlalchemy.sql.selectable import Select, CTE
 
-from rdfdf.sparql2sql import Translator, create_databricks_engine
+from sparql2sql.sparql2sql import Translator, create_databricks_engine
 
 
 class TestTranslator(unittest.TestCase):

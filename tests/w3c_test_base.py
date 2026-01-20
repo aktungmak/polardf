@@ -25,7 +25,7 @@ from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
 from sqlalchemy import create_engine
 
-from rdfdf.sparql2sql import Translator, term_to_string, term_to_object_type
+from sparql2sql.sparql2sql import Translator, term_to_string, term_to_object_type
 
 
 # Disable rdflib's literal normalisation to preserve original lexical forms.
