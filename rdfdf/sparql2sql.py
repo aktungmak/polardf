@@ -92,7 +92,7 @@ def term_to_object_type(term) -> Optional[str]:
 
 
 @dataclass(frozen=True)
-class Ctx:
+class Context:
     """Immutable translation context passed to all handlers."""
 
     table: Table
@@ -100,11 +100,11 @@ class Ctx:
     graph_term: Optional[Union[Variable, URIRef]] = None
     _cte_count: int = field(default=0, compare=False)
 
-    def with_graph(self, term) -> "Ctx":
+    def with_graph(self, term) -> "Context":
         """Return new context with graph term set."""
         return replace(self, graph_term=term)
 
-    def next_cte_name(self) -> tuple["Ctx", str]:
+    def next_cte_name(self) -> tuple["Context", str]:
         """Return (new_ctx, cte_name) with incremented counter."""
         return replace(self, _cte_count=self._cte_count + 1), f"cte_{self._cte_count}"
 
@@ -629,7 +629,7 @@ for _agg_name in list(_AGG_FUNCS.keys()) + ["Aggregate_Group_Concat"]:
 # Pattern Translation Registry
 # =============================================================================
 
-_PATTERNS: Dict[str, Callable[[CompValue, Ctx, Engine], QueryResult]] = {}
+_PATTERNS: Dict[str, Callable[[CompValue, Context, Engine], QueryResult]] = {}
 
 
 def pattern_handler(name: str):
@@ -642,7 +642,7 @@ def pattern_handler(name: str):
     return decorator
 
 
-def translate_pattern(node: CompValue, ctx: Ctx, engine: Engine = None) -> QueryResult:
+def translate_pattern(node: CompValue, ctx: Context, engine: Engine = None) -> QueryResult:
     """Dispatch to appropriate pattern handler."""
     if not hasattr(node, "name"):
         raise ValueError(f"Unknown pattern type: {node}")
@@ -663,7 +663,7 @@ def _ot_condition(ot_column, term):
     return ot_column.is_(None) if o_type is None else ot_column == o_type
 
 
-def triple_to_query(triple: tuple, ctx: Ctx) -> Select:
+def triple_to_query(triple: tuple, ctx: Context) -> Select:
     """Convert a single triple pattern to a SELECT query."""
     s, p, o = triple
     columns, conditions = [], []
@@ -735,7 +735,7 @@ def triple_to_query(triple: tuple, ctx: Ctx) -> Select:
     return query
 
 
-def expand_triple(triple: tuple, ctx: Ctx) -> List[Select]:
+def expand_triple(triple: tuple, ctx: Context) -> List[Select]:
     """Expand a triple pattern into one or more Select queries.
 
     Handles SequencePath and MulPath predicates.
@@ -756,7 +756,7 @@ def expand_triple(triple: tuple, ctx: Ctx) -> List[Select]:
     raise NotImplementedError(f"Path type {type(p)} not implemented")
 
 
-def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Ctx) -> Select:
+def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
     """Generate a recursive CTE for MulPath (transitive closure)."""
     pred_value = term_to_string(mulpath.path)
     if pred_value is None:
@@ -837,7 +837,7 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Ctx) -> Select:
 # =============================================================================
 
 
-def join_queries(queries: list, ctx: Ctx) -> QueryResult:
+def join_queries(queries: list, ctx: Context) -> QueryResult:
     """Natural join multiple queries on common variables (SPARQL semantics)."""
     if len(queries) == 1:
         return queries[0]
@@ -880,7 +880,7 @@ def join_queries(queries: list, ctx: Ctx) -> QueryResult:
 
 
 @pattern_handler("BGP")
-def _pattern_bgp(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_bgp(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Basic Graph Pattern."""
     triples = node["triples"]
 
@@ -911,7 +911,7 @@ def _pattern_bgp(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Graph")
-def _pattern_graph(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_graph(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate GRAPH pattern - simply updates context."""
     if not ctx.graph_aware:
         raise ValueError("Graph patterns require graph_aware=True")
@@ -919,7 +919,7 @@ def _pattern_graph(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Project")
-def _pattern_project(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_project(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Project (SELECT) operation."""
     project_vars = node["PV"]
     base_query = translate_pattern(node["p"], ctx, engine)
@@ -950,7 +950,7 @@ def _pattern_project(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Filter")
-def _pattern_filter(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_filter(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Filter operation."""
     inner_query = translate_pattern(node["p"], ctx, engine)
 
@@ -973,7 +973,7 @@ def _pattern_filter(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Distinct")
-def _pattern_distinct(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_distinct(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Distinct operation."""
     inner_query = translate_pattern(node["p"], ctx, engine)
 
@@ -983,7 +983,7 @@ def _pattern_distinct(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Extend")
-def _pattern_extend(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_extend(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Extend (BIND) operation."""
     inner_query = translate_pattern(node["p"], ctx, engine)
     cte = as_cte(inner_query)
@@ -996,7 +996,7 @@ def _pattern_extend(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("OrderBy")
-def _pattern_order_by(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_order_by(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate OrderBy operation."""
     inner_query = translate_pattern(node["p"], ctx, engine)
 
@@ -1021,7 +1021,7 @@ def _pattern_order_by(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Join")
-def _pattern_join(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_join(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Join operation (natural join)."""
     left = translate_pattern(node["p1"], ctx, engine)
     right = translate_pattern(node["p2"], ctx, engine)
@@ -1029,7 +1029,7 @@ def _pattern_join(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Slice")
-def _pattern_slice(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_slice(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Slice (LIMIT/OFFSET) operation."""
     start = getattr(node, "start", 0)
     length = getattr(node, "length", None)
@@ -1049,7 +1049,7 @@ def _pattern_slice(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("LeftJoin")
-def _pattern_left_join(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_left_join(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate LeftJoin (OPTIONAL) operation."""
     left_query = translate_pattern(node["p1"], ctx, engine)
     right_query = translate_pattern(node["p2"], ctx, engine)
@@ -1079,7 +1079,7 @@ def _pattern_left_join(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Union")
-def _pattern_union(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_union(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Union operation (SPARQL UNION -> SQL UNION ALL)."""
     left_q = translate_pattern(node["p1"], ctx, engine)
     right_q = translate_pattern(node["p2"], ctx, engine)
@@ -1100,13 +1100,13 @@ def _pattern_union(node: CompValue, ctx: Ctx, engine) -> QueryResult:
 
 
 @pattern_handler("Group")
-def _pattern_group(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_group(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Group operation."""
     return translate_pattern(node["p"], ctx, engine)
 
 
 @pattern_handler("AggregateJoin")
-def _pattern_aggregate_join(node: CompValue, ctx: Ctx, engine) -> QueryResult:
+def _pattern_aggregate_join(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate AggregateJoin (GROUP BY with aggregates)."""
     inner_query = translate_pattern(node["p"], ctx, engine)
     cte = as_cte(inner_query)
@@ -1171,9 +1171,9 @@ class Translator:
         if create_table:
             self.metadata.create_all(self.engine)
 
-    def _ctx(self) -> Ctx:
+    def _ctx(self) -> Context:
         """Create a fresh translation context."""
-        return Ctx(table=self.table, graph_aware=self.graph_aware)
+        return Context(table=self.table, graph_aware=self.graph_aware)
 
     def execute(self, sparql_query: str) -> Union[CursorResult, bool]:
         """Translate and execute a SPARQL query.
