@@ -840,7 +840,11 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
 
 
 def join_queries(queries: list, ctx: Context) -> QueryResult:
-    """Natural join multiple queries on common variables (SPARQL semantics)."""
+    """Natural join multiple queries on common variables (SPARQL semantics).
+
+    Uses NULL-tolerant join conditions where unbound variables match anything.
+    This is needed for cross-pattern joins (e.g., between UNION branches).
+    """
     if len(queries) == 1:
         return queries[0]
 
@@ -876,6 +880,93 @@ def join_queries(queries: list, ctx: Context) -> QueryResult:
     return select(*final_cols).select_from(*ctes).where(*conditions)
 
 
+def _bgp_join_queries(queries: list, ctx: Context) -> QueryResult:
+    """Join queries within a BGP using strict INNER JOINs.
+
+    Within a Basic Graph Pattern, all triple patterns must match for a solution
+    to exist. Variables are never NULL within a successful BGP match, so we can
+    use efficient INNER JOINs with strict equality instead of NULL-tolerant joins.
+
+    This produces SQL like:
+        cte1 JOIN cte2 ON cte1.x = cte2.x JOIN cte3 ON cte2.y = cte3.y
+    """
+    if len(queries) == 1:
+        return queries[0]
+
+    ctes = [as_cte(q) for q in queries]
+
+    # Order CTEs to minimize intermediate result sizes:
+    ordered_ctes = _order_ctes_for_join(ctes)
+
+    # Start with first CTE as base
+    base_cte = ordered_ctes[0]
+    joined_cols = set(base_cte.c.keys())
+
+    # Track column sources for final projection
+    col_sources = {name: base_cte.c[name] for name in joined_cols}
+
+    # Build the join expression incrementally
+    join_expr = base_cte
+
+    for cte in ordered_ctes[1:]:
+        cte_cols = set(cte.c.keys())
+        common = joined_cols & cte_cols
+
+        if common:
+            # Build strict equality join conditions
+            on_clause = and_(*[col_sources[col] == cte.c[col] for col in common])
+        else:
+            # No common columns - cross join (rare but valid)
+            on_clause = true()
+
+        # Extend the join
+        join_expr = join_expr.join(cte, on_clause)
+
+        # Track new columns (first occurrence wins for projection)
+        for name in cte_cols - joined_cols:
+            col_sources[name] = cte.c[name]
+
+        joined_cols |= cte_cols
+
+    # Build final SELECT with all columns
+    final_cols = [col_sources[name].label(name) for name in col_sources]
+
+    return select(*final_cols).select_from(join_expr)
+
+
+def _order_ctes_for_join(ctes: list) -> list:
+    """Order CTEs to minimize intermediate result sizes during joins.
+
+    Heuristic: Start with CTEs that have fewer columns (likely more selective),
+    then greedily add CTEs that share variables with the already-joined set.
+    """
+    if len(ctes) <= 2:
+        return ctes
+
+    remaining = list(ctes)
+    # Start with the CTE that has the fewest columns (most constrained)
+    remaining.sort(key=lambda c: len(c.c.keys()))
+    ordered = [remaining.pop(0)]
+    joined_cols = set(ordered[0].c.keys())
+
+    while remaining:
+        # Find CTE with most overlap with joined columns
+        best_idx = 0
+        best_overlap = -1
+
+        for i, cte in enumerate(remaining):
+            overlap = len(joined_cols & set(cte.c.keys()))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = i
+
+        chosen = remaining.pop(best_idx)
+        ordered.append(chosen)
+        joined_cols |= set(chosen.c.keys())
+
+    return ordered
+
+
 # =============================================================================
 # Pattern Handlers
 # =============================================================================
@@ -883,7 +974,11 @@ def join_queries(queries: list, ctx: Context) -> QueryResult:
 
 @pattern_handler("BGP")
 def _pattern_bgp(node: CompValue, ctx: Context, engine) -> QueryResult:
-    """Translate Basic Graph Pattern."""
+    """Translate Basic Graph Pattern.
+
+    Uses strict INNER JOINs since all patterns in a BGP must match.
+    Variables are never NULL within a successful BGP match.
+    """
     triples = node["triples"]
 
     if not triples:
@@ -909,7 +1004,7 @@ def _pattern_bgp(node: CompValue, ctx: Context, engine) -> QueryResult:
         )
 
     queries = [q for triple in triples for q in expand_triple(triple, ctx)]
-    return join_queries(queries, ctx)
+    return _bgp_join_queries(queries, ctx)
 
 
 @pattern_handler("Graph")
