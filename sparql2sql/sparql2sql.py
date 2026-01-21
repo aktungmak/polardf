@@ -642,7 +642,9 @@ def pattern_handler(name: str):
     return decorator
 
 
-def translate_pattern(node: CompValue, ctx: Context, engine: Engine = None) -> QueryResult:
+def translate_pattern(
+    node: CompValue, ctx: Context, engine: Engine = None
+) -> QueryResult:
     """Dispatch to appropriate pattern handler."""
     if not hasattr(node, "name"):
         raise ValueError(f"Unknown pattern type: {node}")
@@ -1233,12 +1235,35 @@ class Translator:
 # Convenience Functions
 # =============================================================================
 
+_APP_NAME = "sparql2sql"
+
 
 def create_databricks_engine(
     server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
-    """Create a SQLAlchemy engine for Databricks."""
+    """Create a SQLAlchemy engine for Databricks.
+
+    The engine is configured with _user_agent_entry=sparql2sql so that queries
+    are identifiable in database logging.
+    """
     engine_uri = (
-        f"databricks://token:{access_token}@{server_hostname}?http_path={http_path}"
+        f"databricks://token:{access_token}@{server_hostname}"
+        f"?http_path={http_path}&_user_agent_entry={_APP_NAME}"
     )
     return create_engine(engine_uri, **engine_kwargs)
+
+
+def create_postgres_engine(connection_url: str, **engine_kwargs) -> Engine:
+    """Create a SQLAlchemy engine for PostgreSQL.
+
+    The engine is configured with application_name=sparql2sql so that queries
+    are identifiable in database logging (e.g., in pg_stat_activity).
+
+    Args:
+        connection_url: PostgreSQL connection URL, e.g.,
+            "postgresql://user:password@localhost/dbname"
+        **engine_kwargs: Additional arguments passed to create_engine()
+    """
+    connect_args = engine_kwargs.pop("connect_args", {})
+    connect_args.setdefault("application_name", _APP_NAME)
+    return create_engine(connection_url, connect_args=connect_args, **engine_kwargs)
