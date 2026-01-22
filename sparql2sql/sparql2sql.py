@@ -9,6 +9,7 @@ Design principles:
 """
 
 import itertools
+import re
 from dataclasses import dataclass, replace, field
 from typing import Callable, Dict, List, Optional, Union
 
@@ -187,6 +188,121 @@ _BUILTIN_NOARG = {
 _HASH_FUNCS = {"SHA1", "SHA256", "SHA384", "SHA512"}
 
 _DATETIME_FIELDS = {"YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS"}
+
+# Supported SPARQL REGEX flags (from XPath/XQuery spec)
+# i = case insensitive, m = multiline, s = dot matches newlines, x = extended
+# q = quote (treat pattern as literal string, escaping all special chars)
+_REGEX_FLAGS = {"i", "m", "s", "x", "q"}
+
+
+def _translate_regex(expr, var_to_col, engine):
+    """Translate SPARQL REGEX function to dialect-specific SQL.
+
+    SPARQL semantics: REGEX operates on simple literals (strings).
+    Applying REGEX to a URI or blank node is a type error and should
+    evaluate to false (filtering out the row).
+
+    Supported dialects:
+    - PostgreSQL: Uses ~ (case-sensitive) or ~* (case-insensitive) operators
+    - Databricks: Uses rlike operator with (?flags) prefix in pattern
+    - SQLite: Uses regexp function with (?flags) prefix in pattern
+    """
+    text = translate_expr(expr.text, var_to_col, engine)
+    flags = str(expr.flags) if hasattr(expr, "flags") and expr.flags else ""
+
+    # Validate flags
+    invalid_flags = set(flags) - _REGEX_FLAGS
+    if invalid_flags:
+        raise NotImplementedError(f"Unsupported REGEX flags: {invalid_flags}")
+
+    # Handle 'q' flag (quote) - escape all regex metacharacters in the pattern
+    # This makes the pattern match literally without any regex interpretation
+    if "q" in flags:
+        if not isinstance(expr.pattern, Literal):
+            raise NotImplementedError(
+                "REGEX 'q' flag only supported with literal patterns"
+            )
+        escaped_pattern = re.escape(str(expr.pattern))
+        pattern = literal(escaped_pattern)
+        flags = flags.replace("q", "")  # Remove q flag, handled via escaping
+    else:
+        pattern = translate_expr(expr.pattern, var_to_col, engine)
+
+    if engine is None:
+        raise NotImplementedError("REGEX requires engine for dialect detection")
+
+    dialect = engine.dialect.name
+
+    if dialect == "postgresql":
+        regex_cond = _regex_postgresql(text, pattern, flags)
+    elif dialect == "databricks":
+        regex_cond = _regex_databricks(text, pattern, flags)
+    elif dialect == "sqlite":
+        regex_cond = _regex_sqlite(text, pattern, flags)
+    else:
+        raise NotImplementedError(f"REGEX not supported for dialect: {dialect}")
+
+    # If the text argument is a variable, ensure we only match literals (not URIs)
+    # URIs have NULL in the type column, literals have a type value
+    type_col = _get_type_column(expr.text, var_to_col)
+    if type_col is not None:
+        # Only match if the value is a literal (type column is not null)
+        return and_(type_col.isnot(None), regex_cond)
+
+    return regex_cond
+
+
+def _regex_postgresql(text, pattern, flags):
+    """Generate PostgreSQL regex expression.
+
+    PostgreSQL uses POSIX regex operators:
+    - ~ for case-sensitive match
+    - ~* for case-insensitive match
+    - Other flags are embedded in the pattern using (?flags) syntax
+    """
+    # For PostgreSQL, case-insensitivity uses ~* operator
+    # Other flags (m, s, x) are embedded in the pattern
+    case_insensitive = "i" in flags
+    other_flags = flags.replace("i", "")
+
+    if other_flags:
+        # Embed remaining flags in pattern: (?ms)pattern
+        pattern = literal(f"(?{other_flags})").concat(pattern)
+
+    if case_insensitive:
+        return text.op("~*")(pattern)
+    else:
+        return text.op("~")(pattern)
+
+
+def _regex_databricks(text, pattern, flags):
+    """Generate Databricks regex expression.
+
+    Databricks uses rlike operator with Java regex syntax.
+    All flags are embedded in the pattern using (?flags) syntax.
+    """
+    if flags:
+        # Embed all flags in pattern: (?ims)pattern
+        pattern = literal(f"(?{flags})").concat(pattern)
+
+    return text.op("rlike")(pattern)
+
+
+def _regex_sqlite(text, pattern, flags):
+    """Generate SQLite regex expression.
+
+    SQLite uses the regexp function (must be registered on the connection).
+    Flags are embedded in the pattern using (?flags) syntax.
+
+    Note: The regexp function must be registered using connection.create_function().
+    Python's sqlite3 module can register Python's re.search for this purpose.
+    """
+    if flags:
+        # Embed all flags in pattern: (?ims)pattern
+        pattern = literal(f"(?{flags})").concat(pattern)
+
+    return func.regexp(pattern, text)
+
 
 _AGG_FUNCS = {
     "Aggregate_Count": func.count,
@@ -520,8 +636,11 @@ def _translate_builtin(expr, var_to_col, engine):
         frag = translate_expr(expr.arg2, var_to_col, engine)
         return s.like(literal("%").concat(frag).concat(literal("%")))
 
-    if fname in ("REGEX", "REPLACE"):
-        raise NotImplementedError(f"{fname} is dialect-specific and not implemented")
+    if fname == "REGEX":
+        return _translate_regex(expr, var_to_col, engine)
+
+    if fname == "REPLACE":
+        raise NotImplementedError("REPLACE is dialect-specific and not implemented")
 
     if fname in _DATETIME_FIELDS:
         return func.extract(fname.lower(), *args)
@@ -1362,3 +1481,34 @@ def create_postgres_engine(connection_url: str, **engine_kwargs) -> Engine:
     connect_args = engine_kwargs.pop("connect_args", {})
     connect_args.setdefault("application_name", _APP_NAME)
     return create_engine(connection_url, connect_args=connect_args, **engine_kwargs)
+
+
+def create_sqlite_engine(
+    connection_url: str = "sqlite:///:memory:", **engine_kwargs
+) -> Engine:
+    """Create a SQLAlchemy engine for SQLite with REGEXP support.
+
+    This registers a Python-based regexp function that enables the SPARQL
+    REGEX function to work with SQLite databases.
+
+    Args:
+        connection_url: SQLite connection URL, e.g.,
+            "sqlite:///path/to/db.sqlite" or "sqlite:///:memory:"
+        **engine_kwargs: Additional arguments passed to create_engine()
+    """
+    from sqlalchemy import event
+
+    def _sqlite_regexp(pattern: str, text: str) -> bool:
+        """SQLite regexp user function implementation using Python's re module."""
+        if text is None:
+            return False
+        return re.search(pattern, text) is not None
+
+    engine = create_engine(connection_url, **engine_kwargs)
+
+    @event.listens_for(engine, "connect")
+    def _register_regexp(dbapi_connection, connection_record):
+        """Register the regexp function for each new connection."""
+        dbapi_connection.create_function("regexp", 2, _sqlite_regexp)
+
+    return engine

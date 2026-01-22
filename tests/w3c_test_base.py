@@ -23,9 +23,12 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 import rdflib
 from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
-from sqlalchemy import create_engine
-
-from sparql2sql.sparql2sql import Translator, term_to_string, term_to_object_type
+from sparql2sql.sparql2sql import (
+    Translator,
+    term_to_string,
+    term_to_object_type,
+    create_sqlite_engine,
+)
 
 
 # Disable rdflib's literal normalisation to preserve original lexical forms.
@@ -681,8 +684,8 @@ class W3CSparqlTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up class-level resources."""
-        # Create in-memory SQLite database
-        cls.engine = create_engine("sqlite:///:memory:")
+        # Create in-memory SQLite database with REGEXP support
+        cls.engine = create_sqlite_engine("sqlite:///:memory:")
         # Use graph_aware=True to support GRAPH patterns in tests
         # Non-graph queries still work
         cls.translator = Translator(
