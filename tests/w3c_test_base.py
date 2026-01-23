@@ -539,7 +539,9 @@ def _bnode_isomorphic(expected: List[tuple], actual: List[tuple]) -> bool:
     """
     actual_counts = Counter(actual)
 
-    def try_match(expected_row: tuple, actual_row: tuple, mapping: dict) -> Optional[dict]:
+    def try_match(
+        expected_row: tuple, actual_row: tuple, mapping: dict
+    ) -> Optional[dict]:
         """Try to match rows, extending mapping. Returns new mapping or None."""
         new_mapping = dict(mapping)
         reverse = {v: k for k, v in new_mapping.items()}
@@ -592,11 +594,17 @@ def results_equivalent(
     """
     # Check variables match (order doesn't matter)
     if set(actual_vars) != set(expected_vars):
-        return False, f"Variable mismatch: actual={set(actual_vars)}, expected={set(expected_vars)}"
+        return (
+            False,
+            f"Variable mismatch: actual={set(actual_vars)}, expected={set(expected_vars)}",
+        )
 
     # Check row counts
     if len(actual_rows) != len(expected_rows):
-        return False, f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}"
+        return (
+            False,
+            f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}",
+        )
 
     # Normalise rows to tuples (sorted by variable name for consistency)
     sorted_vars = sorted(actual_vars)
@@ -608,7 +616,10 @@ def results_equivalent(
     if _bnode_isomorphic(expected_tuples, actual_tuples):
         return True, ""
 
-    return False, f"Row content mismatch:\nActual: {actual_tuples}\nExpected: {expected_tuples}"
+    return (
+        False,
+        f"Row content mismatch:\nActual: {actual_tuples}\nExpected: {expected_tuples}",
+    )
 
 
 def sanitise_name(name: str) -> str:
