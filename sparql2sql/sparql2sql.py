@@ -82,7 +82,7 @@ def term_to_object_type(term) -> Optional[str]:
         if term.datatype:
             return str(term.datatype)
         if term.language:
-            return f"@{term.language}"
+            return f"@{term.language.lower()}"  # Language tags are case-insensitive (BCP 47)
         return str(XSD.string)
     return None
 
@@ -485,7 +485,7 @@ def _expr_relational(expr, var_to_col, engine):
 
     left = translate_expr(left_expr, var_to_col, engine)
     right = translate_expr(right_expr, var_to_col, engine)
-    right_literal_type = _get_literal_type(right_expr)
+    right_literal_type = term_to_object_type(right_expr)
 
     # Variable vs literal
     if left_type is not None and right_literal_type is not None:
@@ -504,17 +504,6 @@ def _get_type_column(expr, var_to_col):
     if isinstance(expr, Variable):
         type_col_name = f"_ot_{expr}"
         return var_to_col.get(type_col_name)
-    return None
-
-
-def _get_literal_type(expr):
-    """Get the datatype URI string for a Literal expression."""
-    if isinstance(expr, Literal):
-        if expr.datatype:
-            return str(expr.datatype)
-        if expr.language:
-            return f"@{expr.language}"
-        return str(XSD.string)
     return None
 
 
@@ -820,7 +809,6 @@ def _translate_aggregate(expr, var_to_col, engine):
 for _agg_name in list(_AGG_FUNCS.keys()) + ["Aggregate_Group_Concat"]:
     _EXPRS[_agg_name] = _translate_aggregate
 
-
 # =============================================================================
 # Pattern Translation Registry
 # =============================================================================
@@ -839,7 +827,7 @@ def pattern_handler(name: str):
 
 
 def translate_pattern(
-    node: CompValue, ctx: Context, engine: Engine = None
+        node: CompValue, ctx: Context, engine: Engine = None
 ) -> QueryResult:
     """Dispatch to appropriate pattern handler."""
     if not hasattr(node, "name"):
@@ -1363,7 +1351,7 @@ def _pattern_left_join(node: CompValue, ctx: Context, engine) -> QueryResult:
 
     if filter_expr is not None:
         if not (
-            isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
+                isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
         ):
             join_conditions.append(translate_expr(filter_expr, var_to_col, engine))
 
@@ -1427,7 +1415,7 @@ def _pattern_aggregate_join(node: CompValue, ctx: Context, engine) -> QueryResul
 
 
 def create_triples_table(
-    metadata: MetaData, table_name: str, graph_aware: bool = False
+        metadata: MetaData, table_name: str, graph_aware: bool = False
 ) -> Table:
     """Create the triples table definition."""
     columns = [
@@ -1455,11 +1443,11 @@ class Translator:
     """
 
     def __init__(
-        self,
-        engine: Engine,
-        table_name: str = "triples",
-        create_table: bool = False,
-        graph_aware: bool = False,
+            self,
+            engine: Engine,
+            table_name: str = "triples",
+            create_table: bool = False,
+            graph_aware: bool = False,
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -1535,7 +1523,7 @@ _APP_NAME = "sparql2sql"
 
 
 def create_databricks_engine(
-    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for Databricks.
 
@@ -1566,7 +1554,7 @@ def create_postgres_engine(connection_url: str, **engine_kwargs) -> Engine:
 
 
 def create_sqlite_engine(
-    connection_url: str = "sqlite:///:memory:", **engine_kwargs
+        connection_url: str = "sqlite:///:memory:", **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for SQLite with REGEXP support.
 

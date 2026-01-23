@@ -130,7 +130,9 @@ def read_file_content(url_or_path: str) -> str:
     return Path(local_path).read_text(encoding="utf-8")
 
 
-def extract_dataset_clause(sparql_query: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+def extract_dataset_clause(
+    sparql_query: str,
+) -> Tuple[List[str], List[Tuple[str, str]]]:
     """Extract FROM and FROM NAMED URIs from a SPARQL query.
 
     When a SPARQL query contains dataset clauses (FROM / FROM NAMED), these
