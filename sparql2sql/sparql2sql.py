@@ -726,8 +726,44 @@ def _translate_builtin(expr, var_to_col, engine):
             return _type_test_variable(fname, type_col, value_col)
         return true() if _type_test_constant(fname, arg_expr) else not_(true())
 
-    if fname in {"LANG", "DATATYPE"}:
-        raise NotImplementedError(f"{fname} requires schema-specific mapping")
+    if fname == "LANG":
+        # LANG returns the language tag of a literal, or "" if none
+        # For non-literals (URIs, blank nodes), return NULL to trigger error semantics
+        arg_expr = raw_args[0] if raw_args else None
+        type_col = _get_type_column(arg_expr, var_to_col)
+        if type_col is not None:
+            # ot IS NULL means URI/blank node -> NULL (error)
+            # ot LIKE '@%' means language-tagged -> extract tag
+            # otherwise (typed literal) -> empty string
+            return case(
+                (type_col.is_(None), null()),
+                (type_col.like("@%"), func.substr(type_col, 2)),
+                else_=literal(""),
+            )
+        # Constant: check if it's a language-tagged literal
+        if isinstance(arg_expr, Literal) and arg_expr.language:
+            return literal(arg_expr.language.lower())
+        if isinstance(arg_expr, Literal):
+            return literal("")
+        # Non-literal constant -> NULL (error)
+        return null()
+
+    if fname == "LANGMATCHES":
+        lang_tag = translate_expr(expr.arg1, var_to_col, engine)
+        range_val = translate_expr(expr.arg2, var_to_col, engine)
+
+        # Handle "*" wildcard: matches any non-empty language tag
+        if isinstance(expr.arg2, Literal) and str(expr.arg2) == "*":
+            return lang_tag != literal("")
+
+        # BCP 47 basic filtering: exact match OR prefix-with-hyphen match
+        # e.g., "en" matches "en" and "en-gb", but "en-gb" doesn't match "en"
+        lang_lower = func.lower(lang_tag)
+        range_lower = func.lower(range_val)
+        return or_(
+            lang_lower == range_lower,
+            lang_lower.like(range_lower.concat(literal("-%"))),
+        )
 
     raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
 
@@ -767,6 +803,7 @@ for _builtin_name in [
     "Builtin_COALESCE",
     "Builtin_sameTerm",
     "Builtin_LANG",
+    "Builtin_LANGMATCHES",
     "Builtin_DATATYPE",
     "Builtin_isIRI",
     "Builtin_isURI",
