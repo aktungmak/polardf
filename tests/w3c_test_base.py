@@ -23,13 +23,13 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 import rdflib
 from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
+from rdflib.plugins.sparql import parser, algebra
 from sparql2sql.sparql2sql import (
     Translator,
     term_to_string,
     term_to_object_type,
     create_sqlite_engine,
 )
-
 
 # Disable rdflib's literal normalisation to preserve original lexical forms.
 # By default, rdflib normalises typed literals (e.g., "01"^^xsd:integer becomes "1").
@@ -128,6 +128,68 @@ def read_file_content(url_or_path: str) -> str:
         local_path = url_or_path
 
     return Path(local_path).read_text(encoding="utf-8")
+
+
+def extract_dataset_clause(sparql_query: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Extract FROM and FROM NAMED URIs from a SPARQL query.
+
+    When a SPARQL query contains dataset clauses (FROM / FROM NAMED), these
+    specify which graphs should be used for query evaluation. This function
+    parses the query and extracts those URIs.
+
+    Args:
+        sparql_query: The SPARQL query string
+
+    Returns:
+        Tuple of (default_graph_uris, named_graph_tuples) where:
+        - default_graph_uris: List of URIs from FROM clauses (merged into default graph)
+        - named_graph_tuples: List of (name, uri) tuples from FROM NAMED clauses
+          The name is the original URI from the query (may be relative)
+    """
+
+    tree = parser.parseQuery(sparql_query)
+    alg = algebra.translateQuery(tree).algebra
+
+    default_graphs = []
+    named_graphs = []
+
+    if "datasetClause" in alg:
+        for clause in alg["datasetClause"]:
+            if "default" in clause:
+                default_graphs.append(str(clause["default"]))
+            elif "named" in clause:
+                uri = str(clause["named"])
+                # For named graphs, the graph name is the URI itself
+                named_graphs.append((uri, uri))
+
+    return default_graphs, named_graphs
+
+
+def resolve_graph_name(uri: str, query_url: str) -> str:
+    """Resolve a graph name URI to match how rdflib resolves it in result files.
+
+    The W3C test expected results contain relative URIs like <data-g1.ttl> which
+    rdflib resolves to file:// URIs when parsing. We need to resolve graph names
+    the same way so comparisons match.
+
+    Args:
+        uri: The graph name URI (may be relative)
+        query_url: The URL of the query file (used as base for resolution)
+
+    Returns:
+        Resolved graph name as rdflib would produce it
+    """
+    # If already absolute, return as-is
+    if uri.startswith(("http://", "https://", "file://")):
+        return uri
+
+    # Get the local path of the query file
+    local_query_path = resolve_url_to_local_path(query_url)
+    query_dir = str(Path(local_query_path).parent)
+
+    # Resolve to a file:// URI (matching how rdflib resolves relative URIs)
+    resolved_path = str(Path(query_dir) / uri)
+    return f"file://{resolved_path}"
 
 
 class W3CTestCase:
@@ -753,16 +815,73 @@ class W3CSparqlTestBase(unittest.TestCase):
             conn.commit()
 
     def _load_test_data(self, test_case: W3CTestCase):
-        """Load test data into the database."""
+        """Load test data into the database.
+
+        Data can come from two sources:
+        1. The manifest (qt:data, qt:graphData) - stored in test_case
+        2. The query's dataset clause (FROM, FROM NAMED) - parsed from query
+
+        If the manifest specifies data, we use that. Otherwise, we extract
+        dataset clauses from the query and load data from those URIs.
+        """
+        data_urls = test_case.data_urls
+        graph_data = test_case.graph_data
+
+        # If manifest has no data, try to get it from the query's dataset clause
+        if not data_urls and not graph_data:
+            query = read_file_content(test_case.query_url)
+            default_graphs, named_graphs = extract_dataset_clause(query)
+
+            # Resolve relative URIs against the query file location for loading
+            data_urls = [
+                self._resolve_data_url(uri, test_case.query_url)
+                for uri in default_graphs
+            ]
+            # For named graphs: resolve the graph name to match how rdflib resolves
+            # relative URIs in expected result files (file:// URIs)
+            graph_data = [
+                (
+                    resolve_graph_name(name, test_case.query_url),
+                    self._resolve_data_url(uri, test_case.query_url),
+                )
+                for name, uri in named_graphs
+            ]
+
         # Load default graph data (graph_name=None for default graph)
-        for data_url in test_case.data_urls:
+        for data_url in data_urls:
             g = load_graph(data_url)
             self._load_graph_to_db(g, graph_name=None)
 
         # Load named graphs with their graph names
-        for name, url in test_case.graph_data:
+        # The graph name is the original IRI from the query/manifest
+        for name, url in graph_data:
             g = load_graph(url)
             self._load_graph_to_db(g, graph_name=name)
+
+    def _resolve_data_url(self, uri: str, base_url: str) -> str:
+        """Resolve a potentially relative URI against a base URL.
+
+        Dataset clause URIs (from FROM/FROM NAMED) may be relative to the query
+        file location. This method resolves them to absolute URLs.
+
+        Args:
+            uri: The URI from the dataset clause (may be relative)
+            base_url: The URL of the query file (used as base for resolution)
+
+        Returns:
+            Absolute URL that can be used to load the graph
+        """
+        # Already absolute - return as-is
+        if uri.startswith(("http://", "https://", "file://")):
+            return uri
+
+        # Get directory of base URL and append relative URI
+        if base_url.endswith((".rq", ".sparql")):
+            base_dir = "/".join(base_url.split("/")[:-1]) + "/"
+        else:
+            base_dir = base_url if base_url.endswith("/") else base_url + "/"
+
+        return base_dir + uri
 
     def _load_graph_to_db(self, g: Graph, graph_name: Optional[str] = None):
         """Load an rdflib Graph into the database.
