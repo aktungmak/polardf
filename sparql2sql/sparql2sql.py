@@ -333,6 +333,42 @@ _NUMERIC_TYPES = {
 }
 
 # =============================================================================
+# Boolean Expression Detection (for projection)
+# =============================================================================
+
+# Expressions that return boolean values (must be converted to "true"/"false" when projected)
+_BOOLEAN_EXPRS = {
+    "RelationalExpression",
+    "ConditionalAndExpression",
+    "ConditionalOrExpression",
+    "UnaryNot",
+    "Builtin_BOUND",
+    "Builtin_SAMETERM",
+    "Builtin_ISIRI",
+    "Builtin_ISURI",
+    "Builtin_ISBLANK",
+    "Builtin_ISLITERAL",
+    "Builtin_ISNUMERIC",
+    "Builtin_REGEX",
+    "Builtin_CONTAINS",
+    "Builtin_STRSTARTS",
+    "Builtin_STRENDS",
+}
+
+
+def _is_boolean_expr(expr) -> bool:
+    """Check if an expression returns a boolean value."""
+    if isinstance(expr, Literal):
+        return expr.datatype == XSD.boolean
+    return isinstance(expr, CompValue) and expr.name in _BOOLEAN_EXPRS
+
+
+def _bool_to_xsd_string(sql_expr):
+    """Wrap a boolean SQL expression to return XSD boolean string values."""
+    return case((sql_expr, literal("true")), else_=literal("false"))
+
+
+# =============================================================================
 # Effective Boolean Value (EBV)
 # =============================================================================
 
@@ -1206,6 +1242,11 @@ def _pattern_extend(node: CompValue, ctx: Context, engine) -> QueryResult:
     var_to_col = cols(cte)
 
     sql_expr = translate_expr(node["expr"], var_to_col, engine)
+
+    # Boolean expressions must return XSD boolean strings ("true"/"false") when projected
+    if _is_boolean_expr(node["expr"]):
+        sql_expr = _bool_to_xsd_string(sql_expr)
+
     result_columns = list(cte.c) + [sql_expr.label(str(node["var"]))]
 
     return select(*result_columns).select_from(cte)
