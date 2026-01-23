@@ -344,11 +344,11 @@ _BOOLEAN_EXPRS = {
     "UnaryNot",
     "Builtin_BOUND",
     "Builtin_SAMETERM",
-    "Builtin_ISIRI",
-    "Builtin_ISURI",
-    "Builtin_ISBLANK",
-    "Builtin_ISLITERAL",
-    "Builtin_ISNUMERIC",
+    "Builtin_isIRI",
+    "Builtin_isURI",
+    "Builtin_isBLANK",
+    "Builtin_isLITERAL",
+    "Builtin_isNUMERIC",
     "Builtin_REGEX",
     "Builtin_CONTAINS",
     "Builtin_STRSTARTS",
@@ -607,6 +607,38 @@ def _expr_in(expr, var_to_col, engine):
     return lhs.not_in(items) if expr.notin else lhs.in_(items)
 
 
+def _type_test_variable(fname, type_col, value_col):
+    """Generate SQL condition for type test (isLiteral, isBlank, etc.) on a variable."""
+    is_blank = value_col.like(literal("_:%"))
+    numeric_types = [literal(t) for t in _NUMERIC_TYPES]
+
+    if fname == "ISLITERAL":
+        return type_col.isnot(None) if type_col is not None else not_(true())
+    if fname == "ISBLANK":
+        return and_(type_col.is_(None), is_blank) if type_col is not None else is_blank
+    if fname in {"ISIRI", "ISURI"}:
+        not_blank = not_(is_blank)
+        return (
+            and_(type_col.is_(None), not_blank) if type_col is not None else not_blank
+        )
+    if fname == "ISNUMERIC":
+        return type_col.in_(numeric_types) if type_col is not None else not_(true())
+    return not_(true())
+
+
+def _type_test_constant(fname, arg):
+    """Evaluate type test on a constant RDF term. Returns bool."""
+    if fname == "ISLITERAL":
+        return isinstance(arg, Literal)
+    if fname == "ISBLANK":
+        return isinstance(arg, BNode)
+    if fname in {"ISIRI", "ISURI"}:
+        return isinstance(arg, URIRef)
+    if fname == "ISNUMERIC":
+        return isinstance(arg, Literal) and str(arg.datatype or "") in _NUMERIC_TYPES
+    return False
+
+
 def _translate_builtin(expr, var_to_col, engine):
     """Translate SPARQL built-in functions (Builtin_XXX)."""
     fname = expr.name[8:].upper()
@@ -697,7 +729,15 @@ def _translate_builtin(expr, var_to_col, engine):
             )
         return arg1 == arg2
 
-    if fname in {"LANG", "DATATYPE", "ISIRI", "ISBLANK", "ISLITERAL", "ISNUMERIC"}:
+    if fname in {"ISLITERAL", "ISBLANK", "ISIRI", "ISURI", "ISNUMERIC"}:
+        arg_expr = raw_args[0] if raw_args else None
+        if isinstance(arg_expr, Variable):
+            type_col = _get_type_column(arg_expr, var_to_col)
+            value_col = args[0]
+            return _type_test_variable(fname, type_col, value_col)
+        return true() if _type_test_constant(fname, arg_expr) else not_(true())
+
+    if fname in {"LANG", "DATATYPE"}:
         raise NotImplementedError(f"{fname} requires schema-specific mapping")
 
     raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
@@ -739,10 +779,11 @@ for _builtin_name in [
     "Builtin_sameTerm",
     "Builtin_LANG",
     "Builtin_DATATYPE",
-    "Builtin_ISIRI",
-    "Builtin_ISBLANK",
-    "Builtin_ISLITERAL",
-    "Builtin_ISNUMERIC",
+    "Builtin_isIRI",
+    "Builtin_isURI",
+    "Builtin_isBLANK",
+    "Builtin_isLITERAL",
+    "Builtin_isNUMERIC",
 ]:
     _EXPRS[_builtin_name] = _translate_builtin
 
