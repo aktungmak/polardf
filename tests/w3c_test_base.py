@@ -526,6 +526,55 @@ def normalise_value(value: Any) -> Any:
     return s
 
 
+def _is_bnode(value: Any) -> bool:
+    """Check if a normalised value is a blank node."""
+    return value is not None and str(value).startswith("_:")
+
+
+def _bnode_isomorphic(expected: List[tuple], actual: List[tuple]) -> bool:
+    """Check if two result sets are isomorphic with respect to blank nodes.
+
+    Uses backtracking to find a bijective mapping from expected bnodes to
+    actual bnodes that makes the result sets equal as multisets.
+    """
+    actual_counts = Counter(actual)
+
+    def try_match(expected_row: tuple, actual_row: tuple, mapping: dict) -> Optional[dict]:
+        """Try to match rows, extending mapping. Returns new mapping or None."""
+        new_mapping = dict(mapping)
+        reverse = {v: k for k, v in new_mapping.items()}
+
+        for exp_val, act_val in zip(expected_row, actual_row):
+            if _is_bnode(exp_val):
+                if exp_val in new_mapping:
+                    if new_mapping[exp_val] != act_val:
+                        return None
+                elif not _is_bnode(act_val) or act_val in reverse:
+                    return None
+                else:
+                    new_mapping[exp_val] = act_val
+                    reverse[act_val] = exp_val
+            elif exp_val != act_val:
+                return None
+        return new_mapping
+
+    def backtrack(remaining: List[tuple], counts: Counter, mapping: dict) -> bool:
+        if not remaining:
+            return True
+        exp_row, *rest = remaining
+        for act_row, count in counts.items():
+            if count <= 0:
+                continue
+            if (new_mapping := try_match(exp_row, act_row, mapping)) is not None:
+                counts[act_row] -= 1
+                if backtrack(rest, counts, new_mapping):
+                    return True
+                counts[act_row] += 1
+        return False
+
+    return backtrack(expected, actual_counts, {})
+
+
 def results_equivalent(
     actual_vars: List[str],
     actual_rows: List[Dict[str, Any]],
@@ -536,42 +585,30 @@ def results_equivalent(
 
     SPARQL results are sets (unordered) of solutions.
     Variables must match, and the multiset of bindings must match.
+    Blank nodes are compared using isomorphism (bijective mapping).
 
     Returns:
         Tuple of (is_equivalent, explanation_if_not)
     """
     # Check variables match (order doesn't matter)
-    actual_var_set = set(actual_vars)
-    expected_var_set = set(expected_vars)
-
-    if actual_var_set != expected_var_set:
-        return (
-            False,
-            f"Variable mismatch: actual={actual_var_set}, expected={expected_var_set}",
-        )
+    if set(actual_vars) != set(expected_vars):
+        return False, f"Variable mismatch: actual={set(actual_vars)}, expected={set(expected_vars)}"
 
     # Check row counts
     if len(actual_rows) != len(expected_rows):
-        return (
-            False,
-            f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}",
-        )
+        return False, f"Row count mismatch: actual={len(actual_rows)}, expected={len(expected_rows)}"
 
-    # Normalise and compare as multisets using Counter (avoids sorting mixed types)
-    def normalise_row(row: Dict[str, Any], vars: List[str]) -> tuple:
-        """Convert a row to a normalised tuple for comparison."""
-        return tuple(normalise_value(row.get(v)) for v in sorted(vars))
+    # Normalise rows to tuples (sorted by variable name for consistency)
+    sorted_vars = sorted(actual_vars)
+    to_tuple = lambda row: tuple(normalise_value(row.get(v)) for v in sorted_vars)
+    actual_tuples = [to_tuple(r) for r in actual_rows]
+    expected_tuples = [to_tuple(r) for r in expected_rows]
 
-    actual_multiset = Counter(normalise_row(r, actual_vars) for r in actual_rows)
-    expected_multiset = Counter(normalise_row(r, expected_vars) for r in expected_rows)
+    # Check isomorphism (handles both bnode and non-bnode cases)
+    if _bnode_isomorphic(expected_tuples, actual_tuples):
+        return True, ""
 
-    if actual_multiset != expected_multiset:
-        return (
-            False,
-            f"Row content mismatch:\nActual: {dict(actual_multiset)}\nExpected: {dict(expected_multiset)}",
-        )
-
-    return True, ""
+    return False, f"Row content mismatch:\nActual: {actual_tuples}\nExpected: {expected_tuples}"
 
 
 def sanitise_name(name: str) -> str:

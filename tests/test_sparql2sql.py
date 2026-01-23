@@ -816,5 +816,125 @@ class TestEffectiveBooleanValue(unittest.TestCase):
         self.assertNotIn("http://ex.org/s2", subjects)
 
 
+class TestBnodeIsomorphism(unittest.TestCase):
+    """Tests for the blank node isomorphism checker used in W3C test comparison.
+
+    This is a 'test of tests' - ensuring the test infrastructure correctly
+    identifies isomorphic and non-isomorphic result sets with blank nodes.
+    """
+
+    def setUp(self):
+        from tests.w3c_test_base import _bnode_isomorphic
+        self.isomorphic = _bnode_isomorphic
+
+    # === ISOMORPHIC CASES (should return True) ===
+
+    def test_identical_no_bnodes(self):
+        """Identical rows without bnodes are isomorphic."""
+        self.assertTrue(self.isomorphic(
+            [("alice", "knows", "bob")],
+            [("alice", "knows", "bob")],
+        ))
+
+    def test_same_structure_different_bnode_ids(self):
+        """Same structure with different bnode IDs is isomorphic."""
+        self.assertTrue(self.isomorphic(
+            [("_:a1", "knows", "_:b1"), ("_:b1", "knows", "_:a1")],
+            [("_:x9", "knows", "_:y9"), ("_:y9", "knows", "_:x9")],
+        ))
+
+    def test_different_order(self):
+        """Row order doesn't matter (multiset semantics)."""
+        self.assertTrue(self.isomorphic(
+            [("_:a", "knows", "_:b"), ("_:c", "likes", "_:d")],
+            [("_:z", "likes", "_:w"), ("_:x", "knows", "_:y")],
+        ))
+
+    def test_duplicate_rows(self):
+        """Duplicate rows must match in count."""
+        self.assertTrue(self.isomorphic(
+            [("_:a", "type", "Person"), ("_:a", "type", "Person")],
+            [("_:x", "type", "Person"), ("_:x", "type", "Person")],
+        ))
+
+    def test_bnode_chain(self):
+        """Chain of bnodes is isomorphic."""
+        self.assertTrue(self.isomorphic(
+            [("_:a", "next", "_:b"), ("_:b", "next", "_:c")],
+            [("_:1", "next", "_:2"), ("_:2", "next", "_:3")],
+        ))
+
+    def test_self_referential_bnode(self):
+        """Self-referential bnode is isomorphic."""
+        self.assertTrue(self.isomorphic(
+            [("_:a", "knows", "_:a")],
+            [("_:x", "knows", "_:x")],
+        ))
+
+    def test_empty_result_sets(self):
+        """Empty result sets are isomorphic."""
+        self.assertTrue(self.isomorphic([], []))
+
+    # === NON-ISOMORPHIC CASES (should return False) ===
+
+    def test_different_literal_values(self):
+        """Different literal values are not isomorphic."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "name", "Alice")],
+            [("_:x", "name", "Bob")],
+        ))
+
+    def test_different_row_counts(self):
+        """Different row counts are not isomorphic."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "knows", "_:b"), ("_:b", "knows", "_:a")],
+            [("_:x", "knows", "_:y")],
+        ))
+
+    def test_bnode_vs_uri(self):
+        """Bnode cannot map to URI."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "type", "Person")],
+            [("http://alice", "type", "Person")],
+        ))
+
+    def test_non_bijective_two_to_one(self):
+        """Two distinct bnodes cannot map to one (non-bijective)."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "knows", "_:b")],  # 2 distinct bnodes
+            [("_:x", "knows", "_:x")],  # 1 bnode (self-ref)
+        ))
+
+    def test_different_bnode_connections(self):
+        """Different connection structure is not isomorphic."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "knows", "_:b"), ("_:a", "knows", "_:c")],  # a -> b, a -> c
+            [("_:x", "knows", "_:y"), ("_:y", "knows", "_:z")],  # x -> y -> z
+        ))
+
+    def test_inconsistent_bnode_mapping(self):
+        """Bnode mapping must be consistent across rows."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "r1", "_:b"), ("_:a", "r2", "_:c")],  # same _:a in both
+            [("_:x", "r1", "_:y"), ("_:z", "r2", "_:w")],  # different x vs z
+        ))
+
+    # === EDGE CASES ===
+
+    def test_complex_valid_isomorphism(self):
+        """Complex 4-bnode valid isomorphism."""
+        self.assertTrue(self.isomorphic(
+            [("_:a", "r", "_:b"), ("_:c", "r", "_:d"), ("_:a", "s", "_:c")],
+            [("_:1", "r", "_:2"), ("_:3", "r", "_:4"), ("_:1", "s", "_:3")],
+        ))
+
+    def test_complex_invalid_isomorphism(self):
+        """Complex 4-bnode invalid isomorphism (wrong correspondence)."""
+        self.assertFalse(self.isomorphic(
+            [("_:a", "r", "_:b"), ("_:c", "r", "_:d"), ("_:a", "s", "_:c")],
+            [("_:1", "r", "_:2"), ("_:3", "r", "_:4"), ("_:1", "s", "_:4")],  # 4 not 3
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
