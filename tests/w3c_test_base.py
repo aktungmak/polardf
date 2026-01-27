@@ -25,6 +25,7 @@ from rdflib import Graph, Namespace, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS
 from rdflib.plugins.sparql import parser, algebra
 from sparql2sql.sparql2sql import (
+    EMPTY_PROJECTION_MARKER,
     Translator,
     term_to_string,
     term_to_object_type,
@@ -729,6 +730,14 @@ def create_test_method(test_case: W3CTestCase):
         except Exception as e:
             self.skipTest(f"Failed to read query: {e}")
 
+        # Add BASE declaration to resolve relative URIs (e.g., GRAPH <data.ttl>)
+        # The base is the query file's directory, matching how rdflib resolves
+        # URIs when parsing the manifest and expected results
+        query_base = resolve_url_to_local_path(test_case.query_url)
+        query_base_uri = f"file://{query_base.rsplit('/', 1)[0]}/"
+        if not query.strip().upper().startswith("BASE"):
+            query = f"BASE <{query_base_uri}>\n{query}"
+
         # Execute the query through our translator
         # NotImplementedError means the feature isn't supported yet - skip the test
         try:
@@ -760,13 +769,24 @@ def create_test_method(test_case: W3CTestCase):
 
         # Handle SELECT queries (result is a CursorResult)
         actual_rows = result.fetchall()
-
-        # Convert actual results to comparable format
-        # Use result.keys() to get column names (works even with empty results)
         actual_vars = list(result.keys())
-        actual_bindings = [
-            {v: row[i] for i, v in enumerate(actual_vars)} for row in actual_rows
-        ]
+
+        # Validate internal column behaviour:
+        # - Empty SPARQL projection should have only EMPTY_PROJECTION_MARKER
+        # - Non-empty projection should have no internal columns
+        if not expected_vars:
+            if actual_vars != [EMPTY_PROJECTION_MARKER]:
+                self.fail(
+                    f"Empty projection should have ['{EMPTY_PROJECTION_MARKER}'], "
+                    f"got {actual_vars}"
+                )
+            actual_vars = []
+            actual_bindings = [{} for _ in actual_rows]
+        else:
+            internal = [v for v in actual_vars if v.startswith("__")]
+            if internal:
+                self.fail(f"Unexpected internal columns in result: {internal}")
+            actual_bindings = [dict(zip(actual_vars, row)) for row in actual_rows]
 
         # Compare results
         is_eq, reason = results_equivalent(

@@ -1,6 +1,8 @@
 """SPARQL to SQL translation using SQLAlchemy."""
 
 from sparql2sql.sparql2sql import (
+    EMPTY_PROJECTION_MARKER,
+    INTERNAL_GRAPH_COLUMN,
     Translator,
     create_databricks_engine,
     create_postgres_engine,
@@ -8,6 +10,8 @@ from sparql2sql.sparql2sql import (
 )
 
 __all__ = [
+    "EMPTY_PROJECTION_MARKER",
+    "INTERNAL_GRAPH_COLUMN",
     "Translator",
     "create_databricks_engine",
     "create_postgres_engine",

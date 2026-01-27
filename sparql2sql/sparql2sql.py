@@ -99,11 +99,15 @@ class Context:
     table: Table
     graph_aware: bool
     graph_term: Optional[Union[Variable, URIRef]] = None
+    # When True, graph variable is not projected inside GRAPH pattern (proper SPARQL scoping)
+    _inside_graph_var_pattern: bool = False
     _cte_count: int = field(default=0, compare=False)
 
-    def with_graph(self, term) -> "Context":
+    def with_graph(self, term, inside_var_pattern: bool = False) -> "Context":
         """Return new context with graph term set."""
-        return replace(self, graph_term=term)
+        return replace(
+            self, graph_term=term, _inside_graph_var_pattern=inside_var_pattern
+        )
 
     def next_cte_name(self) -> tuple["Context", str]:
         """Return (new_ctx, cte_name) with incremented counter."""
@@ -125,6 +129,11 @@ class Context:
 # Query Utilities
 # =============================================================================
 
+# Marker column for empty SPARQL projections (SQL requires at least one column)
+EMPTY_PROJECTION_MARKER = "__empty__"
+
+# Internal column for graph variable scoping (renamed to user variable in _pattern_graph)
+INTERNAL_GRAPH_COLUMN = "__graph__"
 
 QueryResult = Union[Select, CTE]
 
@@ -990,12 +999,12 @@ def triple_to_query(triple: tuple, ctx: Context) -> Select:
     """Convert a single triple pattern to a SELECT query."""
     s, p, o = triple
     columns, conditions = [], []
-    graph_var = ctx.graph_term if isinstance(ctx.graph_term, Variable) else None
 
     # Subject
     if isinstance(s, Variable):
-        if graph_var and s == graph_var:
-            conditions.append(ctx.table.c.s == ctx.table.c.g)
+        if isinstance(p, Variable) and p == s:
+            # Same variable in subject and predicate - handled in predicate section
+            columns.append(ctx.table.c.s.label(str(s)))
         else:
             columns.append(ctx.table.c.s.label(str(s)))
     elif isinstance(s, BNode):
@@ -1007,10 +1016,8 @@ def triple_to_query(triple: tuple, ctx: Context) -> Select:
 
     # Predicate
     if isinstance(p, Variable):
-        if p == s:
+        if isinstance(s, Variable) and p == s:
             conditions.append(ctx.table.c.p == ctx.table.c.s)
-        elif graph_var and p == graph_var:
-            conditions.append(ctx.table.c.p == ctx.table.c.g)
         else:
             columns.append(ctx.table.c.p.label(str(p)))
     elif isinstance(p, BNode):
@@ -1022,14 +1029,11 @@ def triple_to_query(triple: tuple, ctx: Context) -> Select:
 
     # Object
     if isinstance(o, Variable):
-        if o == s:
+        if isinstance(s, Variable) and o == s:
             conditions.append(ctx.table.c.o == ctx.table.c.s)
             conditions.append(ctx.table.c.ot.is_(None))
-        elif o == p:
+        elif isinstance(p, Variable) and o == p:
             conditions.append(ctx.table.c.o == ctx.table.c.p)
-            conditions.append(ctx.table.c.ot.is_(None))
-        elif graph_var and o == graph_var:
-            conditions.append(ctx.table.c.o == ctx.table.c.g)
             conditions.append(ctx.table.c.ot.is_(None))
         else:
             columns.append(ctx.table.c.o.label(str(o)))
@@ -1045,12 +1049,18 @@ def triple_to_query(triple: tuple, ctx: Context) -> Select:
     # Graph context
     if (g_filter := ctx.graph_filter) is not None:
         conditions.append(g_filter)
-        if isinstance(ctx.graph_term, Variable):
+        # Only project graph variable if NOT inside a GRAPH ?g pattern
+        # (proper SPARQL scoping - variable bound after pattern evaluation)
+        if isinstance(ctx.graph_term, Variable) and not ctx._inside_graph_var_pattern:
             columns.append(ctx.table.c.g.label(str(ctx.graph_term)))
+        elif isinstance(ctx.graph_term, Variable):
+            # Use internal name so it's NOT visible to BOUND etc.
+            # _pattern_graph will rename it to the variable name after evaluation
+            columns.append(ctx.table.c.g.label(INTERNAL_GRAPH_COLUMN))
 
-    # Ensure valid SELECT clause
+    # Ensure valid SELECT clause (SQL requires at least one column)
     if not columns:
-        columns = [literal(1).label("_exists_")]
+        columns = [literal(1).label(EMPTY_PROJECTION_MARKER)]
 
     query = select(*columns).select_from(ctx.table)
     if conditions:
@@ -1303,23 +1313,28 @@ def _pattern_bgp(node: CompValue, ctx: Context, engine) -> QueryResult:
     triples = node["triples"]
 
     if not triples:
-        # Empty BGP handling
+        # Empty BGP handling - returns one empty solution if conditions met
         if ctx.graph_term is None:
             if not ctx.graph_aware:
-                return select(literal(1).label("_exists_"))
+                return select(literal(1).label(EMPTY_PROJECTION_MARKER))
             return (
-                select(literal(1).label("_exists_"))
+                select(literal(1).label(EMPTY_PROJECTION_MARKER))
+                .select_from(ctx.table)
                 .where(ctx.table.c.g.is_(None))
                 .limit(1)
             )
         if isinstance(ctx.graph_term, Variable):
+            # Inside GRAPH ?g: use internal column name so var is NOT in scope
+            # Renamed to the variable by _pattern_graph after inner evaluation
             return (
-                select(ctx.table.c.g.label(str(ctx.graph_term)))
+                select(ctx.table.c.g.label(INTERNAL_GRAPH_COLUMN))
                 .where(ctx.table.c.g.isnot(None))
                 .distinct()
             )
+        # Specific graph: check existence
         return (
-            select(literal(1).label("_exists_"))
+            select(literal(1).label(EMPTY_PROJECTION_MARKER))
+            .select_from(ctx.table)
             .where(ctx.table.c.g == str(ctx.graph_term))
             .limit(1)
         )
@@ -1330,15 +1345,49 @@ def _pattern_bgp(node: CompValue, ctx: Context, engine) -> QueryResult:
 
 @pattern_handler("Graph")
 def _pattern_graph(node: CompValue, ctx: Context, engine) -> QueryResult:
-    """Translate GRAPH pattern - simply updates context."""
+    """Translate GRAPH pattern with proper variable scoping.
+
+    SPARQL semantics: the graph variable in GRAPH ?g { P } is NOT in scope
+    inside P. It's only bound after P is evaluated, then unified with any
+    bindings of the same variable from inside P.
+    """
     if not ctx.graph_aware:
         raise ValueError("Graph patterns require graph_aware=True")
-    return translate_pattern(node["p"], ctx.with_graph(node["term"]), engine)
+
+    graph_term = node["term"]
+
+    if not isinstance(graph_term, Variable):
+        return translate_pattern(node["p"], ctx.with_graph(graph_term), engine)
+
+    # Translate inner pattern with graph variable hidden (proper scoping)
+    inner_ctx = ctx.with_graph(graph_term, inside_var_pattern=True)
+    cte = as_cte(translate_pattern(node["p"], inner_ctx, engine))
+    graph_var_name = str(graph_term)
+
+    # Keep all columns except internal graph col and any same-named binding
+    cols = [c for c in cte.c if c.key not in (INTERNAL_GRAPH_COLUMN, graph_var_name)]
+    cols.append(cte.c[INTERNAL_GRAPH_COLUMN].label(graph_var_name))
+    query = select(*cols).select_from(cte)
+
+    # Unify if inner pattern also bound this variable (e.g., GRAPH ?g { ?g ?p ?o })
+    if graph_var_name in cte.c.keys():
+        query = query.where(
+            or_(
+                cte.c[graph_var_name].is_(None),
+                cte.c[graph_var_name] == cte.c[INTERNAL_GRAPH_COLUMN],
+            )
+        )
+
+    return query
 
 
 @pattern_handler("Project")
 def _pattern_project(node: CompValue, ctx: Context, engine) -> QueryResult:
-    """Translate Project (SELECT) operation."""
+    """Translate Project (SELECT) operation.
+
+    For empty projections, results contain EMPTY_PROJECTION_MARKER ('__empty__')
+    since SQL requires at least one column.
+    """
     project_vars = node["PV"]
     base_query = translate_pattern(node["p"], ctx, engine)
     var_names = [str(var) for var in project_vars]
@@ -1349,7 +1398,7 @@ def _pattern_project(node: CompValue, ctx: Context, engine) -> QueryResult:
 
     if not project_vars:
         cte = as_cte(base_query)
-        return select(literal(1).label("__placeholder__")).select_from(cte)
+        return select(literal(1).label(EMPTY_PROJECTION_MARKER)).select_from(cte)
 
     # For CTE, wrap with select; for Select, use with_only_columns to preserve ORDER BY
     if isinstance(base_query, CTE):
@@ -1642,10 +1691,11 @@ class Translator:
     def _translate_select(self, select_query: CompValue) -> Select:
         """Translate a SelectQuery."""
         base_query = translate_pattern(select_query["p"], self._ctx(), self.engine)
-
-        if isinstance(base_query, CTE):
-            return select(*base_query.c).select_from(base_query)
-        return base_query
+        return (
+            base_query
+            if isinstance(base_query, Select)
+            else select(*base_query.c).select_from(base_query)
+        )
 
     def _translate_ask(self, ask_query: CompValue) -> Select:
         """Translate an AskQuery to SELECT EXISTS(...)."""
