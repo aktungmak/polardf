@@ -148,6 +148,50 @@ def col_names(query: QueryResult) -> set:
     return set(cols(query).keys())
 
 
+def _project_columns(
+    col_map: Dict[str, Column], var_names: list[str], include_ot: bool = False
+) -> list[Column]:
+    """Build column list for projection, with optional _ot_* type columns.
+
+    Args:
+        col_map: Column name -> Column mapping (from cols())
+        var_names: Variable names to project
+        include_ot: If True, include _ot_* type columns for term identity semantics
+
+    Returns:
+        List of columns (with NULL for missing vars)
+    """
+    result = []
+    for var in var_names:
+        col = col_map.get(var)
+        result.append(col if col is not None else null().label(var))
+        if include_ot:
+            ot_col = col_map.get(f"_ot_{var}")
+            if ot_col is not None:
+                result.append(ot_col)
+    return result
+
+
+def _apply_distinct(query: QueryResult, columns: list[Column] = None) -> QueryResult:
+    """Apply DISTINCT to a query, optionally projecting specific columns.
+
+    Args:
+        query: Source query (CTE or Select)
+        columns: If provided, project these columns; otherwise use all columns
+
+    Returns:
+        Query with DISTINCT applied
+    """
+    if columns is None:
+        if isinstance(query, CTE):
+            return select(*query.c).select_from(query).distinct()
+        return query.distinct()
+
+    if isinstance(query, CTE):
+        return select(*columns).select_from(query).distinct()
+    return query.with_only_columns(*columns).distinct()
+
+
 # =============================================================================
 # Lookup Tables for Operators and Functions
 # =============================================================================
@@ -864,7 +908,7 @@ def pattern_handler(name: str):
 
 
 def translate_pattern(
-        node: CompValue, ctx: Context, engine: Engine = None
+    node: CompValue, ctx: Context, engine: Engine = None
 ) -> QueryResult:
     """Dispatch to appropriate pattern handler."""
     if not hasattr(node, "name"):
@@ -1241,30 +1285,23 @@ def _pattern_project(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Project (SELECT) operation."""
     project_vars = node["PV"]
     base_query = translate_pattern(node["p"], ctx, engine)
-    base_cols = col_names(base_query)
-    project_var_names = {str(var) for var in project_vars}
+    var_names = [str(var) for var in project_vars]
 
-    if base_cols == project_var_names:
+    # No-op if columns already match
+    if col_names(base_query) == set(var_names):
         return base_query
 
     if not project_vars:
-        if isinstance(base_query, CTE):
-            return select(literal(1).label("__placeholder__")).select_from(base_query)
-        return base_query.with_only_columns(literal(1).label("__placeholder__"))
+        cte = as_cte(base_query)
+        return select(literal(1).label("__placeholder__")).select_from(cte)
 
+    # For CTE, wrap with select; for Select, use with_only_columns to preserve ORDER BY
     if isinstance(base_query, CTE):
-        var_columns = [
-            base_query.c[str(var)] if str(var) in base_cols else null().label(str(var))
-            for var in project_vars
-        ]
-        return select(*var_columns).select_from(base_query)
+        return select(*_project_columns(cols(base_query), var_names)).select_from(
+            base_query
+        )
 
-    var_to_col = {col.key: col for col in base_query.selected_columns}
-    var_columns = [
-        var_to_col[str(var)] if str(var) in var_to_col else null().label(str(var))
-        for var in project_vars
-    ]
-    return base_query.with_only_columns(*var_columns)
+    return base_query.with_only_columns(*_project_columns(cols(base_query), var_names))
 
 
 @pattern_handler("Filter")
@@ -1292,12 +1329,26 @@ def _pattern_filter(node: CompValue, ctx: Context, engine) -> QueryResult:
 
 @pattern_handler("Distinct")
 def _pattern_distinct(node: CompValue, ctx: Context, engine) -> QueryResult:
-    """Translate Distinct operation."""
-    inner_query = translate_pattern(node["p"], ctx, engine)
+    """Translate Distinct operation with term identity semantics.
 
-    if isinstance(inner_query, CTE):
-        return select(*inner_query.c).select_from(inner_query).distinct()
-    return inner_query.distinct()
+    SPARQL DISTINCT compares by term identity (value + datatype), not just value.
+    We include _ot_* (object type) columns in the comparison, then strip them.
+    """
+    inner_node = node["p"]
+
+    # If inner node is Project, include _ot_* columns for term identity comparison
+    if hasattr(inner_node, "name") and inner_node.name == "Project":
+        var_names = [str(var) for var in inner_node["PV"]]
+        bgp_query = translate_pattern(inner_node["p"], ctx, engine)
+        distinct_cols = _project_columns(cols(bgp_query), var_names, include_ot=True)
+
+        # DISTINCT on value + type columns, then strip _ot_* in final projection
+        cte = as_cte(_apply_distinct(bgp_query, distinct_cols))
+        user_cols = [cte.c[v] for v in var_names if v in cte.c.keys()]
+        return select(*user_cols).select_from(cte)
+
+    # Non-Project: simple DISTINCT
+    return _apply_distinct(translate_pattern(inner_node, ctx, engine))
 
 
 @pattern_handler("Extend")
@@ -1388,7 +1439,7 @@ def _pattern_left_join(node: CompValue, ctx: Context, engine) -> QueryResult:
 
     if filter_expr is not None:
         if not (
-                isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
+            isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
         ):
             join_conditions.append(translate_expr(filter_expr, var_to_col, engine))
 
@@ -1452,7 +1503,7 @@ def _pattern_aggregate_join(node: CompValue, ctx: Context, engine) -> QueryResul
 
 
 def create_triples_table(
-        metadata: MetaData, table_name: str, graph_aware: bool = False
+    metadata: MetaData, table_name: str, graph_aware: bool = False
 ) -> Table:
     """Create the triples table definition."""
     columns = [
@@ -1480,11 +1531,11 @@ class Translator:
     """
 
     def __init__(
-            self,
-            engine: Engine,
-            table_name: str = "triples",
-            create_table: bool = False,
-            graph_aware: bool = False,
+        self,
+        engine: Engine,
+        table_name: str = "triples",
+        create_table: bool = False,
+        graph_aware: bool = False,
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -1560,7 +1611,7 @@ _APP_NAME = "sparql2sql"
 
 
 def create_databricks_engine(
-        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for Databricks.
 
@@ -1591,7 +1642,7 @@ def create_postgres_engine(connection_url: str, **engine_kwargs) -> Engine:
 
 
 def create_sqlite_engine(
-        connection_url: str = "sqlite:///:memory:", **engine_kwargs
+    connection_url: str = "sqlite:///:memory:", **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for SQLite with REGEXP support.
 
