@@ -1,4 +1,4 @@
-.PHONY: test test-sqlalch test-w3c test-w3c-10 test-w3c-11 clone-w3c-tests
+.PHONY: test test-sqlalch test-w3c test-w3c-10 test-w3c-11 clone-w3c-tests update-w3c-report
 
 # W3C RDF tests repository location
 W3C_TESTS_DIR = tests/rdf-tests
@@ -29,3 +29,11 @@ test-w3c-10: clone-w3c-tests
 # SPARQL 1.1 tests (data-sparql11) - includes property paths, aggregates, etc.
 test-w3c-11: clone-w3c-tests
 	./venv/bin/python -m unittest tests.test_w3c_sparql11 -v
+
+# Run W3C tests and update README.md with a summary report
+# Uses -k to continue running even if some tests fail
+update-w3c-report:
+	@echo "Running W3C test suites..."
+	@$(MAKE) -k test-w3c 2>&1 | tee .test_output.tmp; \
+	./venv/bin/python scripts/update_test_report.py .test_output.tmp; \
+	rm -f .test_output.tmp
