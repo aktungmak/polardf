@@ -108,13 +108,12 @@ def generate_report(results: dict) -> str:
         f"| **Total** | **{total_passed}** | **{total_failed}** | **{total_errors}** | **{total_skipped}** | **{grand_total}** |"
     )
 
-    # Calculate pass rate (excluding skipped)
-    executed = total_passed + total_failed + total_errors
-    if executed > 0:
-        pass_rate = (total_passed / executed) * 100
+    # Calculate pass rate
+    if grand_total > 0:
+        pass_rate = (total_passed / grand_total) * 100
         lines.append("")
         lines.append(
-            f"**Pass rate: {pass_rate:.1f}%** ({total_passed}/{executed} executed tests)"
+            f"**Pass rate: {pass_rate:.1f}%** ({total_passed}/{grand_total} tests)"
         )
 
     return "\n".join(lines)

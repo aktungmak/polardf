@@ -24,7 +24,7 @@ data for querying.
 
 ### W3C Test Suite Results
 
-_Last updated: 2026-01-27 18:00:48_
+_Last updated: 2026-01-27 18:30:42_
 
 | Suite | Passed | Failed | Errors | Skipped | Total |
 |-------|--------|--------|--------|---------|-------|
@@ -32,4 +32,4 @@ _Last updated: 2026-01-27 18:00:48_
 | SPARQL 1.1 | 88 | 87 | 0 | 127 | 302 |
 | **Total** | **317** | **113** | **0** | **147** | **577** |
 
-**Pass rate: 73.7%** (317/430 executed tests)
+**Pass rate: 54.9%** (317/577 tests)
