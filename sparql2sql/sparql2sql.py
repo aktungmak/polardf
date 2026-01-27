@@ -376,6 +376,13 @@ _NUMERIC_TYPES = {
     str(XSD.positiveInteger),
 }
 
+# Pre-computed SQL literals for type comparisons (avoid repeated list comprehensions)
+_NUMERIC_TYPE_LITERALS = tuple(literal(t) for t in _NUMERIC_TYPES)
+_ORDERABLE_TYPES = {str(XSD.string), str(XSD.dateTime), str(XSD.date), str(XSD.time)}
+_ORDERABLE_TYPE_LITERALS = tuple(
+    literal(str(t)) for t in (XSD.string, XSD.dateTime, XSD.date, XSD.time)
+)
+
 # =============================================================================
 # Boolean Expression Detection (for projection)
 # =============================================================================
@@ -552,41 +559,90 @@ def _get_type_column(expr, var_to_col):
 
 
 def _value_cmp(left, left_type, right, right_type, op):
-    """Value-aware comparison between two variables."""
-    numeric_types = [literal(t) for t in _NUMERIC_TYPES]
-    both_numeric = and_(left_type.in_(numeric_types), right_type.in_(numeric_types))
-    lexical_compatible = or_(
-        and_(left_type.is_(None), right_type.is_(None)),
-        and_(left_type.isnot(None), right_type.isnot(None), left_type == right_type),
-    )
+    """Value-aware comparison between two variables.
 
-    left_real, right_real = func.cast(left, Float), func.cast(right, Float)
+    Uses CASE for efficient SQL with short-circuit evaluation. Comparability rules:
+    - URI/bnodes (type IS NULL): compare lexically with each other
+    - Numeric types: compare by value (with ill-formed literal guard)
+    - Same orderable type (string, dateTime, date, time): compare lexically
+    - Same language tag: compare lexically
+    - Different term kinds (URI vs literal, lang vs typed): always != (type error for ordering)
+    - Unknown types: same-term equality only; type error otherwise
+    """
     cmp_op = _RELATIONAL_OPS[op]
+    left_v, right_v = func.cast(left, Float), func.cast(right, Float)
 
-    if op in ("=", "!="):
-        equal_cond = or_(
-            and_(both_numeric, left_real == right_real),
-            and_(lexical_compatible, left == right),
+    # Comparability predicates (ordered for CASE short-circuit efficiency)
+    both_uri = and_(left_type.is_(None), right_type.is_(None))
+    both_numeric = and_(
+        left_type.in_(_NUMERIC_TYPE_LITERALS), right_type.in_(_NUMERIC_TYPE_LITERALS)
+    )
+    same_orderable = and_(
+        left_type.in_(_ORDERABLE_TYPE_LITERALS), left_type == right_type
+    )
+    same_lang = and_(left_type.like("@%"), left_type == right_type)
+
+    if op == "=":
+        # Guard for ill-formed numerics: both cast to 0 but different lexical form
+        numeric_eq = and_(left_v == right_v, or_(left_v != literal(0), left == right))
+        return case(
+            (both_uri, left == right),
+            (both_numeric, numeric_eq),
+            (or_(same_orderable, same_lang), left == right),
+            (left_type == right_type, left == right),  # same-term for unknown types
+            else_=literal(False),
         )
-        return equal_cond if op == "=" else not_(equal_cond)
 
+    if op == "!=":
+        # Different term kinds are definitively unequal
+        l_uri, r_uri = left_type.is_(None), right_type.is_(None)
+        l_lang, r_lang = left_type.like("@%"), right_type.like("@%")
+        different_kinds = or_(
+            and_(l_uri, not_(r_uri)),
+            and_(not_(l_uri), r_uri),
+            and_(l_lang, not_(or_(r_uri, r_lang))),
+            and_(not_(or_(l_uri, l_lang)), r_lang),
+        )
+        return case(
+            (different_kinds, literal(True)),
+            (both_numeric, left_v != right_v),
+            (both_uri, left != right),
+            (or_(same_orderable, same_lang), left != right),
+            else_=literal(False),
+        )
+
+    # Ordering (<, >, <=, >=): numeric by value, orderable by lexical, else type error
     return case(
-        (both_numeric, cmp_op(left_real, right_real)), else_=cmp_op(left, right)
+        (both_numeric, cmp_op(left_v, right_v)),
+        (same_orderable, cmp_op(left, right)),
+        else_=null(),
     )
 
 
 def _value_cmp_with_literal(var_value, var_type, lit_value, lit_type_str, op):
-    """Compare a variable to a literal with type awareness."""
+    """Compare a variable to a literal with type awareness.
+
+    Since the literal type is known at translation time, we generate optimised SQL
+    without runtime type dispatch. Comparability rules:
+    - Numeric: compare by value if variable is also numeric
+    - Orderable (string, dateTime, date, time) or lang-tagged: compare lexically
+    - Unknown type: same-term equality only; type error otherwise
+    """
     cmp_op = _RELATIONAL_OPS[op]
 
     if lit_type_str in _NUMERIC_TYPES:
-        var_is_numeric = var_type.in_([literal(t) for t in _NUMERIC_TYPES])
         return and_(
-            var_is_numeric,
+            var_type.in_(_NUMERIC_TYPE_LITERALS),
             cmp_op(func.cast(var_value, Float), func.cast(lit_value, Float)),
         )
 
-    return and_(var_type == literal(lit_type_str), cmp_op(var_value, lit_value))
+    if lit_type_str in _ORDERABLE_TYPES or lit_type_str.startswith("@"):
+        return and_(var_type == literal(lit_type_str), cmp_op(var_value, lit_value))
+
+    # Unknown type: only same-term equality is valid
+    if op == "=":
+        return and_(var_type == literal(lit_type_str), var_value == lit_value)
+    return literal(False)
 
 
 def _translate_ebv_operand(operand_expr, var_to_col, engine):
