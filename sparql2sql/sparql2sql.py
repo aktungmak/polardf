@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, replace, field
 from typing import Callable, Dict, List, Optional, Union
 
-from rdflib import BNode, Literal, URIRef, XSD
+from rdflib import BNode, Literal, RDF, URIRef, XSD
 from rdflib.paths import MulPath, Path, SequencePath
 from rdflib.plugins.sparql import algebra, parser
 from rdflib.plugins.sparql.parserutils import CompValue
@@ -899,6 +899,28 @@ def _translate_builtin(expr, var_to_col, engine):
             lang_lower == range_lower,
             lang_lower.like(range_lower.concat(literal("-%"))),
         )
+
+    if fname == "DATATYPE":
+        # DATATYPE returns the datatype IRI of a literal
+        # For non-literals (URIs, blank nodes), return NULL (error semantics)
+        arg_expr = raw_args[0] if raw_args else None
+        type_col = _get_type_column(arg_expr, var_to_col)
+        if type_col is not None:
+            # ot IS NULL means URI/blank node -> NULL (error)
+            # ot LIKE '@%' means language-tagged -> rdf:langString
+            # otherwise ot is the datatype URI
+            return case(
+                (type_col.is_(None), null()),
+                (type_col.like("@%"), literal(str(RDF.langString))),
+                else_=type_col,
+            )
+        # Constant handling
+        if isinstance(arg_expr, Literal):
+            if arg_expr.language:
+                return literal(str(RDF.langString))
+            return literal(str(arg_expr.datatype or XSD.string))
+        # Non-literal constant -> NULL (error)
+        return null()
 
     raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
 
