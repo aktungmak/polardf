@@ -763,13 +763,9 @@ def create_test_method(test_case: W3CTestCase):
 
         # Convert actual results to comparable format
         # Use result.keys() to get column names (works even with empty results)
-        # Filter out internal columns (starting with _) - these are implementation details
-        all_vars = list(result.keys())
-        actual_vars = [v for v in all_vars if not v.startswith("_")]
-        # Build bindings with only user-visible variables
+        actual_vars = list(result.keys())
         actual_bindings = [
-            {v: row[i] for i, v in enumerate(all_vars) if not v.startswith("_")}
-            for row in actual_rows
+            {v: row[i] for i, v in enumerate(actual_vars)} for row in actual_rows
         ]
 
         # Compare results
