@@ -763,6 +763,30 @@ def _type_test_constant(fname, arg):
     return False
 
 
+# =============================================================================
+# Built-in Function Handler Registry
+# =============================================================================
+
+_BUILTINS: Dict[str, Callable] = {}
+
+
+def builtin_handler(*names: str):
+    """Decorator to register a built-in function handler.
+
+    Handlers receive (expr, raw_args, args, var_to_col, engine) where:
+      - expr: the original CompValue expression
+      - raw_args: unevaluated argument expressions
+      - args: translated SQLAlchemy column expressions
+      - var_to_col: variable-to-column mapping
+      - engine: SQLAlchemy engine (may be None)
+    """
+    def decorator(fn):
+        for name in names:
+            _BUILTINS[name] = fn
+        return fn
+    return decorator
+
+
 def _translate_builtin(expr, var_to_col, engine):
     """Translate SPARQL built-in functions (Builtin_XXX)."""
     fname = expr.name[8:].upper()
@@ -772,203 +796,239 @@ def _translate_builtin(expr, var_to_col, engine):
         raw_args = [raw_args]
     args = [translate_expr(a, var_to_col, engine) for a in raw_args]
 
-    if fname in _BUILTIN_SIMPLE:
-        return _BUILTIN_SIMPLE[fname](*args)
-
-    if fname in _BUILTIN_NOARG:
-        return _BUILTIN_NOARG[fname]()
-
-    if fname == "IF":
-        return case((args[0], args[1]), else_=args[2])
-
-    if fname == "BOUND":
-        return args[0].isnot(None)
-
-    if fname == "SUBSTR":
-        string_arg = args[0] if args else translate_expr(expr.arg, var_to_col, engine)
-        start = (
-            translate_expr(expr.start, var_to_col, engine)
-            if hasattr(expr, "start")
-            else None
-        )
-        length = (
-            translate_expr(expr.length, var_to_col, engine)
-            if hasattr(expr, "length") and expr.length is not None
-            else None
-        )
-        if length is not None:
-            return func.substr(string_arg, start, length)
-        if start is not None:
-            return func.substr(string_arg, start)
-        return func.substr(string_arg)
-
-    if fname == "CONCAT":
-        if not args:
-            return literal("")
-        result = args[0]
-        for arg in args[1:]:
-            result = result.concat(arg)
-        return result
-
-    if fname == "STR":
-        return args[0]
-
-    if fname == "STRSTARTS":
-        s = translate_expr(expr.arg1, var_to_col, engine)
-        prefix = translate_expr(expr.arg2, var_to_col, engine)
-        return s.like(prefix.concat(literal("%")))
-
-    if fname == "STRENDS":
-        s = translate_expr(expr.arg1, var_to_col, engine)
-        suffix = translate_expr(expr.arg2, var_to_col, engine)
-        return s.like(literal("%").concat(suffix))
-
-    if fname == "CONTAINS":
-        s = translate_expr(expr.arg1, var_to_col, engine)
-        frag = translate_expr(expr.arg2, var_to_col, engine)
-        return s.like(literal("%").concat(frag).concat(literal("%")))
-
-    if fname == "REGEX":
-        return _translate_regex(expr, var_to_col, engine)
-
-    if fname == "REPLACE":
-        raise NotImplementedError("REPLACE is dialect-specific and not implemented")
-
-    if fname in _DATETIME_FIELDS:
-        return func.extract(fname.lower(), *args)
-
-    if fname in _HASH_FUNCS:
-        return getattr(func, fname.lower())(*args)
-
-    if fname == "SAMETERM":
-        arg1 = translate_expr(expr.arg1, var_to_col, engine)
-        arg2 = translate_expr(expr.arg2, var_to_col, engine)
-        type1 = _get_type_column(expr.arg1, var_to_col)
-        type2 = _get_type_column(expr.arg2, var_to_col)
-
-        if type1 is not None and type2 is not None:
-            return and_(
-                arg1 == arg2,
-                or_(and_(type1.is_(None), type2.is_(None)), type1 == type2),
-            )
-        return arg1 == arg2
-
-    if fname in {"ISLITERAL", "ISBLANK", "ISIRI", "ISURI", "ISNUMERIC"}:
-        arg_expr = raw_args[0] if raw_args else None
-        if isinstance(arg_expr, Variable):
-            type_col = _get_type_column(arg_expr, var_to_col)
-            value_col = args[0]
-            return _type_test_variable(fname, type_col, value_col)
-        return true() if _type_test_constant(fname, arg_expr) else not_(true())
-
-    if fname == "LANG":
-        # LANG returns the language tag of a literal, or "" if none
-        # For non-literals (URIs, blank nodes), return NULL to trigger error semantics
-        arg_expr = raw_args[0] if raw_args else None
-        type_col = _get_type_column(arg_expr, var_to_col)
-        if type_col is not None:
-            # ot IS NULL means URI/blank node -> NULL (error)
-            # ot LIKE '@%' means language-tagged -> extract tag
-            # otherwise (typed literal) -> empty string
-            return case(
-                (type_col.is_(None), null()),
-                (type_col.like("@%"), func.substr(type_col, 2)),
-                else_=literal(""),
-            )
-        # Constant: check if it's a language-tagged literal
-        if isinstance(arg_expr, Literal) and arg_expr.language:
-            return literal(arg_expr.language.lower())
-        if isinstance(arg_expr, Literal):
-            return literal("")
-        # Non-literal constant -> NULL (error)
-        return null()
-
-    if fname == "LANGMATCHES":
-        lang_tag = translate_expr(expr.arg1, var_to_col, engine)
-        range_val = translate_expr(expr.arg2, var_to_col, engine)
-
-        # Handle "*" wildcard: matches any non-empty language tag
-        if isinstance(expr.arg2, Literal) and str(expr.arg2) == "*":
-            return lang_tag != literal("")
-
-        # BCP 47 basic filtering: exact match OR prefix-with-hyphen match
-        # e.g., "en" matches "en" and "en-gb", but "en-gb" doesn't match "en"
-        lang_lower = func.lower(lang_tag)
-        range_lower = func.lower(range_val)
-        return or_(
-            lang_lower == range_lower,
-            lang_lower.like(range_lower.concat(literal("-%"))),
-        )
-
-    if fname == "DATATYPE":
-        # DATATYPE returns the datatype IRI of a literal
-        # For non-literals (URIs, blank nodes), return NULL (error semantics)
-        arg_expr = raw_args[0] if raw_args else None
-        type_col = _get_type_column(arg_expr, var_to_col)
-        if type_col is not None:
-            # ot IS NULL means URI/blank node -> NULL (error)
-            # ot LIKE '@%' means language-tagged -> rdf:langString
-            # otherwise ot is the datatype URI
-            return case(
-                (type_col.is_(None), null()),
-                (type_col.like("@%"), literal(str(RDF.langString))),
-                else_=type_col,
-            )
-        # Constant handling
-        if isinstance(arg_expr, Literal):
-            if arg_expr.language:
-                return literal(str(RDF.langString))
-            return literal(str(arg_expr.datatype or XSD.string))
-        # Non-literal constant -> NULL (error)
-        return null()
+    # Dispatch to registered handler
+    handler = _BUILTINS.get(fname)
+    if handler:
+        return handler(expr, raw_args, args, var_to_col, engine)
 
     raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
 
 
 # Register all Builtin_ handlers dynamically
 for _builtin_name in [
-    "Builtin_IF",
-    "Builtin_BOUND",
-    "Builtin_SUBSTR",
-    "Builtin_CONCAT",
-    "Builtin_STR",
-    "Builtin_STRSTARTS",
-    "Builtin_STRENDS",
-    "Builtin_CONTAINS",
-    "Builtin_REGEX",
-    "Builtin_REPLACE",
-    "Builtin_STRLEN",
-    "Builtin_UCASE",
-    "Builtin_LCASE",
-    "Builtin_ABS",
-    "Builtin_ROUND",
-    "Builtin_CEIL",
-    "Builtin_FLOOR",
-    "Builtin_RAND",
-    "Builtin_NOW",
-    "Builtin_YEAR",
-    "Builtin_MONTH",
-    "Builtin_DAY",
-    "Builtin_HOURS",
-    "Builtin_MINUTES",
-    "Builtin_SECONDS",
-    "Builtin_MD5",
-    "Builtin_SHA1",
-    "Builtin_SHA256",
-    "Builtin_SHA384",
-    "Builtin_SHA512",
-    "Builtin_COALESCE",
-    "Builtin_sameTerm",
-    "Builtin_LANG",
-    "Builtin_LANGMATCHES",
-    "Builtin_DATATYPE",
-    "Builtin_isIRI",
-    "Builtin_isURI",
-    "Builtin_isBLANK",
-    "Builtin_isLITERAL",
-    "Builtin_isNUMERIC",
+    "Builtin_IF", "Builtin_BOUND", "Builtin_SUBSTR", "Builtin_CONCAT",
+    "Builtin_STR", "Builtin_STRSTARTS", "Builtin_STRENDS", "Builtin_CONTAINS",
+    "Builtin_REGEX", "Builtin_REPLACE", "Builtin_STRLEN", "Builtin_UCASE",
+    "Builtin_LCASE", "Builtin_ABS", "Builtin_ROUND", "Builtin_CEIL",
+    "Builtin_FLOOR", "Builtin_RAND", "Builtin_NOW", "Builtin_YEAR",
+    "Builtin_MONTH", "Builtin_DAY", "Builtin_HOURS", "Builtin_MINUTES",
+    "Builtin_SECONDS", "Builtin_MD5", "Builtin_SHA1", "Builtin_SHA256",
+    "Builtin_SHA384", "Builtin_SHA512", "Builtin_COALESCE", "Builtin_sameTerm",
+    "Builtin_LANG", "Builtin_LANGMATCHES", "Builtin_DATATYPE", "Builtin_isIRI",
+    "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL", "Builtin_isNUMERIC",
 ]:
     _EXPRS[_builtin_name] = _translate_builtin
+
+
+# --- Built-in Function Handlers ---
+
+
+@builtin_handler("STRLEN", "UCASE", "LCASE", "ABS", "ROUND", "CEIL", "FLOOR", "COALESCE")
+def _builtin_simple(expr, raw_args, args, var_to_col, engine):
+    """Handle simple built-ins that map directly to SQL functions."""
+    fname = expr.name[8:].upper()
+    return _BUILTIN_SIMPLE[fname](*args)
+
+
+@builtin_handler("MD5", "SHA1", "SHA256", "SHA384", "SHA512")
+def _builtin_hash(expr, raw_args, args, var_to_col, engine):
+    """Handle hash functions."""
+    fname = expr.name[8:].upper()
+    return getattr(func, fname.lower())(*args)
+
+
+@builtin_handler("RAND", "NOW")
+def _builtin_noarg(expr, raw_args, args, var_to_col, engine):
+    """Handle no-argument built-ins."""
+    fname = expr.name[8:].upper()
+    return _BUILTIN_NOARG[fname]()
+
+
+@builtin_handler("YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS")
+def _builtin_datetime(expr, raw_args, args, var_to_col, engine):
+    """Handle datetime field extraction."""
+    fname = expr.name[8:].upper()
+    return func.extract(fname.lower(), *args)
+
+
+@builtin_handler("IF")
+def _builtin_if(expr, raw_args, args, var_to_col, engine):
+    """Handle IF(condition, then, else)."""
+    return case((args[0], args[1]), else_=args[2])
+
+
+@builtin_handler("BOUND")
+def _builtin_bound(expr, raw_args, args, var_to_col, engine):
+    """Handle BOUND(?var) - true if variable is bound."""
+    return args[0].isnot(None)
+
+
+@builtin_handler("SUBSTR")
+def _builtin_substr(expr, raw_args, args, var_to_col, engine):
+    """Handle SUBSTR(string, start [, length])."""
+    string_arg = args[0] if args else translate_expr(expr.arg, var_to_col, engine)
+    start = (
+        translate_expr(expr.start, var_to_col, engine)
+        if hasattr(expr, "start") else None
+    )
+    length = (
+        translate_expr(expr.length, var_to_col, engine)
+        if hasattr(expr, "length") and expr.length is not None else None
+    )
+    if length is not None:
+        return func.substr(string_arg, start, length)
+    return func.substr(string_arg, start) if start is not None else func.substr(string_arg)
+
+
+@builtin_handler("CONCAT")
+def _builtin_concat(expr, raw_args, args, var_to_col, engine):
+    """Handle CONCAT(str1, str2, ...)."""
+    if not args:
+        return literal("")
+    result = args[0]
+    for arg in args[1:]:
+        result = result.concat(arg)
+    return result
+
+
+@builtin_handler("STR")
+def _builtin_str(expr, raw_args, args, var_to_col, engine):
+    """Handle STR(term) - convert to string representation."""
+    return args[0]
+
+
+@builtin_handler("STRSTARTS")
+def _builtin_strstarts(expr, raw_args, args, var_to_col, engine):
+    """Handle STRSTARTS(string, prefix)."""
+    s = translate_expr(expr.arg1, var_to_col, engine)
+    prefix = translate_expr(expr.arg2, var_to_col, engine)
+    return s.like(prefix.concat(literal("%")))
+
+
+@builtin_handler("STRENDS")
+def _builtin_strends(expr, raw_args, args, var_to_col, engine):
+    """Handle STRENDS(string, suffix)."""
+    s = translate_expr(expr.arg1, var_to_col, engine)
+    suffix = translate_expr(expr.arg2, var_to_col, engine)
+    return s.like(literal("%").concat(suffix))
+
+
+@builtin_handler("CONTAINS")
+def _builtin_contains(expr, raw_args, args, var_to_col, engine):
+    """Handle CONTAINS(string, fragment)."""
+    s = translate_expr(expr.arg1, var_to_col, engine)
+    frag = translate_expr(expr.arg2, var_to_col, engine)
+    return s.like(literal("%").concat(frag).concat(literal("%")))
+
+
+@builtin_handler("REGEX")
+def _builtin_regex(expr, raw_args, args, var_to_col, engine):
+    """Handle REGEX(string, pattern [, flags])."""
+    return _translate_regex(expr, var_to_col, engine)
+
+
+@builtin_handler("REPLACE")
+def _builtin_replace(expr, raw_args, args, var_to_col, engine):
+    """Handle REPLACE - not yet implemented."""
+    raise NotImplementedError("REPLACE is dialect-specific and not implemented")
+
+
+@builtin_handler("SAMETERM")
+def _builtin_sameterm(expr, raw_args, args, var_to_col, engine):
+    """Handle sameTerm(a, b) - strict term equality."""
+    arg1 = translate_expr(expr.arg1, var_to_col, engine)
+    arg2 = translate_expr(expr.arg2, var_to_col, engine)
+    type1 = _get_type_column(expr.arg1, var_to_col)
+    type2 = _get_type_column(expr.arg2, var_to_col)
+
+    if type1 is not None and type2 is not None:
+        return and_(
+            arg1 == arg2,
+            or_(and_(type1.is_(None), type2.is_(None)), type1 == type2),
+        )
+    return arg1 == arg2
+
+
+@builtin_handler("ISLITERAL", "ISBLANK", "ISIRI", "ISURI", "ISNUMERIC")
+def _builtin_type_test(expr, raw_args, args, var_to_col, engine):
+    """Handle type test functions (isLiteral, isBlank, isIRI, isURI, isNumeric)."""
+    fname = expr.name[8:].upper()
+    arg_expr = raw_args[0] if raw_args else None
+    if isinstance(arg_expr, Variable):
+        type_col = _get_type_column(arg_expr, var_to_col)
+        value_col = args[0]
+        return _type_test_variable(fname, type_col, value_col)
+    return true() if _type_test_constant(fname, arg_expr) else not_(true())
+
+
+@builtin_handler("LANG")
+def _builtin_lang(expr, raw_args, args, var_to_col, engine):
+    """Handle LANG(literal) - returns language tag or empty string."""
+    # LANG returns the language tag of a literal, or "" if none
+    # For non-literals (URIs, blank nodes), return NULL to trigger error semantics
+    arg_expr = raw_args[0] if raw_args else None
+    type_col = _get_type_column(arg_expr, var_to_col)
+    if type_col is not None:
+        # ot IS NULL means URI/blank node -> NULL (error)
+        # ot LIKE '@%' means language-tagged -> extract tag
+        # otherwise (typed literal) -> empty string
+        return case(
+            (type_col.is_(None), null()),
+            (type_col.like("@%"), func.substr(type_col, 2)),
+            else_=literal(""),
+        )
+    # Constant: check if it's a language-tagged literal
+    if isinstance(arg_expr, Literal) and arg_expr.language:
+        return literal(arg_expr.language.lower())
+    if isinstance(arg_expr, Literal):
+        return literal("")
+    # Non-literal constant -> NULL (error)
+    return null()
+
+
+@builtin_handler("LANGMATCHES")
+def _builtin_langmatches(expr, raw_args, args, var_to_col, engine):
+    """Handle LANGMATCHES(lang_tag, lang_range) - BCP 47 language matching."""
+    lang_tag = translate_expr(expr.arg1, var_to_col, engine)
+    range_val = translate_expr(expr.arg2, var_to_col, engine)
+
+    # Handle "*" wildcard: matches any non-empty language tag
+    if isinstance(expr.arg2, Literal) and str(expr.arg2) == "*":
+        return lang_tag != literal("")
+
+    # BCP 47 basic filtering: exact match OR prefix-with-hyphen match
+    # e.g., "en" matches "en" and "en-gb", but "en-gb" doesn't match "en"
+    lang_lower = func.lower(lang_tag)
+    range_lower = func.lower(range_val)
+    return or_(
+        lang_lower == range_lower,
+        lang_lower.like(range_lower.concat(literal("-%"))),
+    )
+
+
+@builtin_handler("DATATYPE")
+def _builtin_datatype(expr, raw_args, args, var_to_col, engine):
+    """Handle DATATYPE(literal) - returns datatype IRI."""
+    # DATATYPE returns the datatype IRI of a literal
+    # For non-literals (URIs, blank nodes), return NULL (error semantics)
+    arg_expr = raw_args[0] if raw_args else None
+    type_col = _get_type_column(arg_expr, var_to_col)
+    if type_col is not None:
+        # ot IS NULL means URI/blank node -> NULL (error)
+        # ot LIKE '@%' means language-tagged -> rdf:langString
+        # otherwise ot is the datatype URI
+        return case(
+            (type_col.is_(None), null()),
+            (type_col.like("@%"), literal(str(RDF.langString))),
+            else_=type_col,
+        )
+    # Constant handling
+    if isinstance(arg_expr, Literal):
+        if arg_expr.language:
+            return literal(str(RDF.langString))
+        return literal(str(arg_expr.datatype or XSD.string))
+    # Non-literal constant -> NULL (error)
+    return null()
 
 
 def _translate_aggregate(expr, var_to_col, engine):
