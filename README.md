@@ -24,12 +24,12 @@ data for querying.
 
 ### W3C Test Suite Results
 
-_Last updated: 2026-01-27 17:50:07_
+_Last updated: 2026-01-27 18:00:48_
 
 | Suite | Passed | Failed | Errors | Skipped | Total |
 |-------|--------|--------|--------|---------|-------|
-| SPARQL 1.0 | 219 | 25 | 0 | 20 | 264 |
-| SPARQL 1.1 | 85 | 87 | 0 | 126 | 298 |
-| **Total** | **304** | **112** | **0** | **146** | **562** |
+| SPARQL 1.0 | 229 | 26 | 0 | 20 | 275 |
+| SPARQL 1.1 | 88 | 87 | 0 | 127 | 302 |
+| **Total** | **317** | **113** | **0** | **147** | **577** |
 
-**Pass rate: 73.1%** (304/416 executed tests)
+**Pass rate: 73.7%** (317/430 executed tests)
