@@ -567,12 +567,27 @@ def _get_type_column(expr, var_to_col):
     return None
 
 
+# Boolean value semantics: "true"/"1" are equivalent, "false"/"0" are equivalent
+_BOOL_WELL_FORMED = tuple(literal(v) for v in ("true", "false", "1", "0"))
+_bool_is_true = lambda v: or_(v == literal("true"), v == literal("1"))
+
+
+def _bool_eq(left, right):
+    """Boolean equality: normalised comparison if well-formed, else same-term."""
+    both_well_formed = and_(left.in_(_BOOL_WELL_FORMED), right.in_(_BOOL_WELL_FORMED))
+    return case(
+        (both_well_formed, _bool_is_true(left) == _bool_is_true(right)),
+        else_=(left == right),
+    )
+
+
 def _value_cmp(left, left_type, right, right_type, op):
     """Value-aware comparison between two variables.
 
     Uses CASE for efficient SQL with short-circuit evaluation. Comparability rules:
     - URI/bnodes (type IS NULL): compare lexically with each other
     - Numeric types: compare by value (with ill-formed literal guard)
+    - Boolean: normalise (true/1 and false/0 are equivalent); ill-formed uses same-term
     - Same orderable type (string, dateTime, date, time): compare lexically
     - Same language tag: compare lexically
     - Different term kinds (URI vs literal, lang vs typed): always != (type error for ordering)
@@ -586,6 +601,9 @@ def _value_cmp(left, left_type, right, right_type, op):
     both_numeric = and_(
         left_type.in_(_NUMERIC_TYPE_LITERALS), right_type.in_(_NUMERIC_TYPE_LITERALS)
     )
+    both_boolean = and_(
+        left_type == literal(str(XSD.boolean)), right_type == literal(str(XSD.boolean))
+    )
     same_orderable = and_(
         left_type.in_(_ORDERABLE_TYPE_LITERALS), left_type == right_type
     )
@@ -597,6 +615,7 @@ def _value_cmp(left, left_type, right, right_type, op):
         return case(
             (both_uri, left == right),
             (both_numeric, numeric_eq),
+            (both_boolean, _bool_eq(left, right)),
             (or_(same_orderable, same_lang), left == right),
             (left_type == right_type, left == right),  # same-term for unknown types
             else_=literal(False),
@@ -615,6 +634,7 @@ def _value_cmp(left, left_type, right, right_type, op):
         return case(
             (different_kinds, literal(True)),
             (both_numeric, left_v != right_v),
+            (both_boolean, not_(_bool_eq(left, right))),
             (both_uri, left != right),
             (or_(same_orderable, same_lang), left != right),
             else_=literal(False),
@@ -634,6 +654,7 @@ def _value_cmp_with_literal(var_value, var_type, lit_value, lit_type_str, op):
     Since the literal type is known at translation time, we generate optimised SQL
     without runtime type dispatch. Comparability rules:
     - Numeric: compare by value if variable is also numeric
+    - Boolean: normalise both values (true/1 and false/0 are equivalent)
     - Orderable (string, dateTime, date, time) or lang-tagged: compare lexically
     - Unknown type: same-term equality only; type error otherwise
     """
@@ -644,6 +665,11 @@ def _value_cmp_with_literal(var_value, var_type, lit_value, lit_type_str, op):
             var_type.in_(_NUMERIC_TYPE_LITERALS),
             cmp_op(func.cast(var_value, Float), func.cast(lit_value, Float)),
         )
+
+    if lit_type_str == str(XSD.boolean):
+        is_bool = var_type == literal(lit_type_str)
+        eq = _bool_eq(var_value, literal(lit_value))
+        return and_(is_bool, eq if op == "=" else not_(eq))
 
     if lit_type_str in _ORDERABLE_TYPES or lit_type_str.startswith("@"):
         return and_(var_type == literal(lit_type_str), cmp_op(var_value, lit_value))
