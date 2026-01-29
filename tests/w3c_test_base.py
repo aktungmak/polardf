@@ -156,7 +156,7 @@ def extract_dataset_clause(
     default_graphs = []
     named_graphs = []
 
-    if "datasetClause" in alg:
+    if alg.get("datasetClause"):
         for clause in alg["datasetClause"]:
             if "default" in clause:
                 default_graphs.append(str(clause["default"]))
@@ -521,6 +521,46 @@ class SparqlResultParser:
 
         return variables, bindings_list
 
+    def parse_tsv(
+        self, filepath: str
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Parse SPARQL Results TSV format (.tsv).
+
+        TSV format has a header row with variable names (prefixed with ?)
+        followed by data rows with tab-separated values.
+
+        Returns:
+            Tuple of (variable_names, list_of_bindings)
+        """
+        content = read_file_content(filepath)
+        lines = content.strip().split("\n")
+
+        if not lines:
+            return [], []
+
+        # Parse header - variable names prefixed with ?
+        header = lines[0].split("\t")
+        variables = [v.lstrip("?") for v in header]
+
+        # Parse data rows
+        bindings_list = []
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            values = line.split("\t")
+            binding = {}
+            for var, val in zip(variables, values):
+                # Empty values become None (unbound)
+                if not val:
+                    binding[var] = None
+                else:
+                    # Keep values as-is - they use SPARQL syntax
+                    # (<uri>, "literal", _:bnode, plain numbers)
+                    binding[var] = val
+            bindings_list.append(binding)
+
+        return variables, bindings_list
+
     def parse(
         self, filepath: str
     ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
@@ -529,14 +569,19 @@ class SparqlResultParser:
 
         if ext == ".srx":
             return self.parse_srx(filepath)
+        elif ext == ".tsv":
+            return self.parse_tsv(filepath)
         elif ext in (".ttl", ".rdf", ".n3"):
             return self.parse_ttl_results(filepath)
         else:
-            # Try both formats
+            # Try formats in order
             try:
                 return self.parse_srx(filepath)
             except Exception:
-                return self.parse_ttl_results(filepath)
+                try:
+                    return self.parse_tsv(filepath)
+                except Exception:
+                    return self.parse_ttl_results(filepath)
 
 
 def normalise_value(value: Any) -> Any:
