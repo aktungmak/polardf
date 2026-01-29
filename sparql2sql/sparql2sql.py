@@ -158,7 +158,7 @@ def col_names(query: QueryResult) -> set:
 
 
 def _project_columns(
-    col_map: Dict[str, Column], var_names: list[str], include_ot: bool = False
+        col_map: Dict[str, Column], var_names: list[str], include_ot: bool = False
 ) -> list[Column]:
     """Build column list for projection, with optional _ot_* type columns.
 
@@ -780,10 +780,12 @@ def builtin_handler(*names: str):
       - var_to_col: variable-to-column mapping
       - engine: SQLAlchemy engine (may be None)
     """
+
     def decorator(fn):
         for name in names:
             _BUILTINS[name] = fn
         return fn
+
     return decorator
 
 
@@ -806,16 +808,46 @@ def _translate_builtin(expr, var_to_col, engine):
 
 # Register all Builtin_ handlers dynamically
 for _builtin_name in [
-    "Builtin_IF", "Builtin_BOUND", "Builtin_SUBSTR", "Builtin_CONCAT",
-    "Builtin_STR", "Builtin_STRSTARTS", "Builtin_STRENDS", "Builtin_CONTAINS",
-    "Builtin_REGEX", "Builtin_REPLACE", "Builtin_STRLEN", "Builtin_UCASE",
-    "Builtin_LCASE", "Builtin_ABS", "Builtin_ROUND", "Builtin_CEIL",
-    "Builtin_FLOOR", "Builtin_RAND", "Builtin_NOW", "Builtin_YEAR",
-    "Builtin_MONTH", "Builtin_DAY", "Builtin_HOURS", "Builtin_MINUTES",
-    "Builtin_SECONDS", "Builtin_MD5", "Builtin_SHA1", "Builtin_SHA256",
-    "Builtin_SHA384", "Builtin_SHA512", "Builtin_COALESCE", "Builtin_sameTerm",
-    "Builtin_LANG", "Builtin_LANGMATCHES", "Builtin_DATATYPE", "Builtin_isIRI",
-    "Builtin_isURI", "Builtin_isBLANK", "Builtin_isLITERAL", "Builtin_isNUMERIC",
+    "Builtin_IF",
+    "Builtin_BOUND",
+    "Builtin_SUBSTR",
+    "Builtin_CONCAT",
+    "Builtin_STR",
+    "Builtin_STRSTARTS",
+    "Builtin_STRENDS",
+    "Builtin_CONTAINS",
+    "Builtin_REGEX",
+    "Builtin_REPLACE",
+    "Builtin_STRLEN",
+    "Builtin_UCASE",
+    "Builtin_LCASE",
+    "Builtin_ABS",
+    "Builtin_ROUND",
+    "Builtin_CEIL",
+    "Builtin_FLOOR",
+    "Builtin_RAND",
+    "Builtin_NOW",
+    "Builtin_YEAR",
+    "Builtin_MONTH",
+    "Builtin_DAY",
+    "Builtin_HOURS",
+    "Builtin_MINUTES",
+    "Builtin_SECONDS",
+    "Builtin_MD5",
+    "Builtin_SHA1",
+    "Builtin_SHA256",
+    "Builtin_SHA384",
+    "Builtin_SHA512",
+    "Builtin_COALESCE",
+    "Builtin_sameTerm",
+    "Builtin_LANG",
+    "Builtin_LANGMATCHES",
+    "Builtin_DATATYPE",
+    "Builtin_isIRI",
+    "Builtin_isURI",
+    "Builtin_isBLANK",
+    "Builtin_isLITERAL",
+    "Builtin_isNUMERIC",
 ]:
     _EXPRS[_builtin_name] = _translate_builtin
 
@@ -823,7 +855,9 @@ for _builtin_name in [
 # --- Built-in Function Handlers ---
 
 
-@builtin_handler("STRLEN", "UCASE", "LCASE", "ABS", "ROUND", "CEIL", "FLOOR", "COALESCE")
+@builtin_handler(
+    "STRLEN", "UCASE", "LCASE", "ABS", "ROUND", "CEIL", "FLOOR", "COALESCE"
+)
 def _builtin_simple(expr, raw_args, args, var_to_col, engine):
     """Handle simple built-ins that map directly to SQL functions."""
     fname = expr.name[8:].upper()
@@ -869,15 +903,19 @@ def _builtin_substr(expr, raw_args, args, var_to_col, engine):
     string_arg = args[0] if args else translate_expr(expr.arg, var_to_col, engine)
     start = (
         translate_expr(expr.start, var_to_col, engine)
-        if hasattr(expr, "start") else None
+        if hasattr(expr, "start")
+        else None
     )
     length = (
         translate_expr(expr.length, var_to_col, engine)
-        if hasattr(expr, "length") and expr.length is not None else None
+        if hasattr(expr, "length") and expr.length is not None
+        else None
     )
     if length is not None:
         return func.substr(string_arg, start, length)
-    return func.substr(string_arg, start) if start is not None else func.substr(string_arg)
+    return (
+        func.substr(string_arg, start) if start is not None else func.substr(string_arg)
+    )
 
 
 @builtin_handler("CONCAT")
@@ -1081,7 +1119,7 @@ def pattern_handler(name: str):
 
 
 def translate_pattern(
-    node: CompValue, ctx: Context, engine: Engine = None
+        node: CompValue, ctx: Context, engine: Engine = None
 ) -> QueryResult:
     """Dispatch to appropriate pattern handler."""
     if not hasattr(node, "name"):
@@ -1564,6 +1602,16 @@ def _pattern_distinct(node: CompValue, ctx: Context, engine) -> QueryResult:
     return _apply_distinct(translate_pattern(inner_node, ctx, engine))
 
 
+@pattern_handler("Reduced")
+def _pattern_reduced(node: CompValue, ctx: Context, engine) -> QueryResult:
+    """Translate SELECT REDUCED patterns.
+
+    SPARQL REDUCED permits but does not require duplicate elimination.
+    We treat it as a no-op since that is what the W3C test suite expects.
+    """
+    return translate_pattern(node["p"], ctx, engine)
+
+
 @pattern_handler("Extend")
 def _pattern_extend(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Extend (BIND) operation."""
@@ -1652,7 +1700,7 @@ def _pattern_left_join(node: CompValue, ctx: Context, engine) -> QueryResult:
 
     if filter_expr is not None:
         if not (
-            isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
+                isinstance(filter_expr, CompValue) and filter_expr.name == "TrueFilter"
         ):
             join_conditions.append(translate_expr(filter_expr, var_to_col, engine))
 
@@ -1716,7 +1764,7 @@ def _pattern_aggregate_join(node: CompValue, ctx: Context, engine) -> QueryResul
 
 
 def create_triples_table(
-    metadata: MetaData, table_name: str, graph_aware: bool = False
+        metadata: MetaData, table_name: str, graph_aware: bool = False
 ) -> Table:
     """Create the triples table definition."""
     columns = [
@@ -1744,11 +1792,11 @@ class Translator:
     """
 
     def __init__(
-        self,
-        engine: Engine,
-        table_name: str = "triples",
-        create_table: bool = False,
-        graph_aware: bool = False,
+            self,
+            engine: Engine,
+            table_name: str = "triples",
+            create_table: bool = False,
+            graph_aware: bool = False,
     ):
         self.engine = engine
         self.metadata = MetaData()
@@ -1825,7 +1873,7 @@ _APP_NAME = "sparql2sql"
 
 
 def create_databricks_engine(
-    server_hostname: str, http_path: str, access_token: str, **engine_kwargs
+        server_hostname: str, http_path: str, access_token: str, **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for Databricks.
 
@@ -1856,7 +1904,7 @@ def create_postgres_engine(connection_url: str, **engine_kwargs) -> Engine:
 
 
 def create_sqlite_engine(
-    connection_url: str = "sqlite:///:memory:", **engine_kwargs
+        connection_url: str = "sqlite:///:memory:", **engine_kwargs
 ) -> Engine:
     """Create a SQLAlchemy engine for SQLite with REGEXP support.
 

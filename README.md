@@ -13,8 +13,8 @@ possible, however the following are actively tested:
 - Postgres
 - Databricks
 
-The library is tested against the official W3C test suites and
-currently has a coverage of around 60%.
+The library is tested against the official W3C test suites to validate
+feature coverage and correctness, see the latest coverage below.
 
 ### Alternatives
 [rdflib-sqlalchemy](https://github.com/RDFLib/rdflib-sqlalchemy)
@@ -24,12 +24,12 @@ data for querying.
 
 ### W3C Test Suite Results
 
-_Last updated: 2026-01-27 18:30:42_
+_Last updated: 2026-01-29 14:42:29_
 
 | Suite | Passed | Failed | Errors | Skipped | Total |
 |-------|--------|--------|--------|---------|-------|
-| SPARQL 1.0 | 229 | 26 | 0 | 20 | 275 |
+| SPARQL 1.0 | 231 | 26 | 0 | 18 | 275 |
 | SPARQL 1.1 | 88 | 87 | 0 | 127 | 302 |
-| **Total** | **317** | **113** | **0** | **147** | **577** |
+| **Total** | **319** | **113** | **0** | **145** | **577** |
 
-**Pass rate: 54.9%** (317/577 tests)
+**Pass rate: 55.3%** (319/577 tests)
