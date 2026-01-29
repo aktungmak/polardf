@@ -711,6 +711,18 @@ def _expr_not(expr, var_to_col, engine):
     return not_(_translate_ebv_operand(expr.expr, var_to_col, engine))
 
 
+@expr_handler("UnaryPlus")
+def _expr_unary_plus(expr, var_to_col, engine):
+    """Translate + prefix (identity for numeric values)."""
+    return translate_expr(expr.expr, var_to_col, engine)
+
+
+@expr_handler("UnaryMinus")
+def _expr_unary_minus(expr, var_to_col, engine):
+    """Translate - prefix (negation for numeric values)."""
+    return -translate_expr(expr.expr, var_to_col, engine)
+
+
 @expr_handler("AdditiveExpression")
 @expr_handler("MultiplicativeExpression")
 def _expr_binary_chain(expr, var_to_col, engine):
