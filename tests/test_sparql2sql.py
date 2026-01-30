@@ -430,6 +430,73 @@ class TestMulPath(unittest.TestCase):
 
         self.assertNotIn("http://example.org/other1", reachable)
 
+    def test_zero_length_star_includes_start(self):
+        """Test p* includes zero-length path (start node itself)."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:start ex:path_pred* ?y }
+        """
+        result = self.translator.execute(sparql_query)
+        reachable = {row.y for row in result.fetchall()}
+
+        # Zero-length path means start connects to itself
+        self.assertIn("http://example.org/start", reachable)
+
+    def test_zero_length_plus_excludes_start(self):
+        """Test p+ excludes zero-length path (one-or-more only)."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:start ex:path_pred+ ?y }
+        """
+        result = self.translator.execute(sparql_query)
+        reachable = {row.y for row in result.fetchall()}
+
+        # p+ requires at least one hop - start should NOT be included
+        self.assertNotIn("http://example.org/start", reachable)
+        # But reachable nodes should still be found
+        self.assertIn("http://example.org/node1", reachable)
+        self.assertIn("http://example.org/end", reachable)
+
+    def test_zero_or_one_includes_start_and_one_hop(self):
+        """Test p? includes zero-length and exactly one hop."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:start ex:path_pred? ?y }
+        """
+        result = self.translator.execute(sparql_query)
+        reachable = {row.y for row in result.fetchall()}
+
+        # Zero-length: start itself
+        self.assertIn("http://example.org/start", reachable)
+        # One hop: node1 and alt (direct neighbours)
+        self.assertIn("http://example.org/node1", reachable)
+        self.assertIn("http://example.org/alt", reachable)
+        # Two hops: should NOT be included
+        self.assertNotIn("http://example.org/node2", reachable)
+        self.assertNotIn("http://example.org/end", reachable)
+
+    def test_zero_length_with_both_variables(self):
+        """Test p* with unbound variables includes all self-loops."""
+        sparql_query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x ?y WHERE { ?x ex:path_pred* ?y }
+        """
+        result = self.translator.execute(sparql_query)
+        pairs = {(row.x, row.y) for row in result.fetchall()}
+
+        # All graph nodes should have zero-length self-loops
+        graph_nodes = {
+            "http://example.org/start",
+            "http://example.org/node1",
+            "http://example.org/node2",
+            "http://example.org/end",
+            "http://example.org/alt",
+            "http://example.org/other1",
+            "http://example.org/other2",
+        }
+        for node in graph_nodes:
+            self.assertIn((node, node), pairs, f"Missing zero-length for {node}")
+
 
 class TestNestedPaths(unittest.TestCase):
     """Tests for nested path expressions (e.g., p/q*, p*/q)."""
@@ -509,7 +576,6 @@ class TestNestedPaths(unittest.TestCase):
         # Only bob has a likes edge, so result should be eve
         self.assertIn("http://example.org/eve", ends)
 
-    @unittest.expectedFailure  # TODO: Zero-length path support for MulPath (* and ?)
     def test_mulpath_in_middle_of_sequence(self):
         """Test p/q*/r - simple, transitive, simple."""
         # alice --knows--> bob --knows*--> X --likes--> eve
@@ -554,7 +620,6 @@ class TestNestedPaths(unittest.TestCase):
                 compiled = sql_query.compile()
                 self.assertIsNotNone(compiled)
 
-    @unittest.expectedFailure  # TODO: CTE name collision with multiple MulPaths
     def test_multiple_mulpaths_compile(self):
         """Test that multiple MulPaths in sequence compile correctly."""
         query = "SELECT * WHERE { ?s <p>?/<q>* ?o }"

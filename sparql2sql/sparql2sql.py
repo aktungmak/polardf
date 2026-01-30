@@ -14,7 +14,14 @@ from dataclasses import dataclass, replace, field
 from typing import Callable, Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, RDF, URIRef, XSD
-from rdflib.paths import AlternativePath, InvPath, MulPath, NegatedPath, Path, SequencePath
+from rdflib.paths import (
+    AlternativePath,
+    InvPath,
+    MulPath,
+    NegatedPath,
+    Path,
+    SequencePath,
+)
 from rdflib.plugins.sparql import algebra, parser
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Variable
@@ -42,7 +49,9 @@ from sqlalchemy import (
     quoted_name,
     select,
     true,
+    union,
 )
+from sqlalchemy.sql.selectable import SelectBase
 
 
 # =============================================================================
@@ -1301,6 +1310,15 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
 
     base_query = select(*base_cols).where(and_(*base_conditions))
 
+    # For p? (zero-or-one), we only want length 0 or 1, so skip recursion
+    if mulpath.zero and not mulpath.more:
+        # p? = zero-length UNION one-hop
+        one_hop = _build_mulpath_result(
+            base_query.cte(), s, o, s_value, o_value, o_type, ctx
+        )
+        zero_len = _zero_length_query(s, o, s_value, o_value, ctx)
+        return union_all_queries([one_hop, zero_len], s, o, ctx)
+
     ctx, cte_name = ctx.next_cte_name()
     path_cte = base_query.cte(name=f"path_{cte_name}", recursive=True)
 
@@ -1326,7 +1344,22 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
 
     path_cte = path_cte.union(recursive_query)
 
-    # Build result columns
+    positive_paths = _build_mulpath_result(
+        path_cte, s, o, s_value, o_value, o_type, ctx
+    )
+
+    # For p* (zero-or-more), UNION with zero-length paths
+    if mulpath.zero:
+        zero_len = _zero_length_query(s, o, s_value, o_value, ctx)
+        return union_all_queries([positive_paths, zero_len], s, o, ctx)
+
+    return positive_paths
+
+
+def _build_mulpath_result(
+    path_cte, s, o, s_value, o_value, o_type, ctx: Context
+) -> Select:
+    """Build the final SELECT from a MulPath CTE with appropriate filters."""
     result_columns = []
     if isinstance(s, Variable):
         result_columns.append(path_cte.c.s.label(str(s)))
@@ -1350,10 +1383,70 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
         else:
             conditions.append(path_cte.c.ot == o_type)
 
-    if conditions:
-        final_query = final_query.where(and_(*conditions))
+    return final_query.where(and_(*conditions)) if conditions else final_query
 
-    return final_query
+
+def _zero_length_query(s, o, s_value, o_value, ctx: Context) -> Optional[Select]:
+    """Generate query for zero-length path matches (node = node)."""
+    # Both bound - only match if equal
+    if s_value is not None and o_value is not None:
+        return (
+            _literal_row({str(s): s_value, str(o): o_value})
+            if s_value == o_value
+            else None
+        )
+
+    # Output variables: (name, is_node_var) - node vars get the value, graph var gets NULL
+    out_vars = [
+        (str(v), v in (s, o)) for v in [s, o, ctx.graph_term] if isinstance(v, Variable)
+    ]
+    if not out_vars:
+        return None
+
+    # One bound - literal row
+    if (bound := s_value or o_value) is not None:
+        return _literal_row(
+            {name: bound if is_node else None for name, is_node in out_vars}
+        )
+
+    # Both unbound - select from all graph nodes
+    nodes = _all_graph_nodes(ctx).subquery()
+    return select(
+        *[
+            nodes.c.node.label(name) if is_node else literal(None).label(name)
+            for name, is_node in out_vars
+        ]
+    ).select_from(nodes)
+
+
+def _all_graph_nodes(ctx: Context):
+    """Return union of all subjects and non-literal objects in the graph."""
+    t, g = ctx.table, ctx.graph_filter
+    subjects = select(t.c.s.label("node"))
+    objects = select(t.c.o.label("node")).where(t.c.ot.is_(None))
+    if g:
+        subjects, objects = subjects.where(g), objects.where(g)
+    return union(subjects, objects)
+
+
+def _literal_row(columns: dict) -> Select:
+    """Generate a single-row SELECT with literal values."""
+    return select(*[literal(v).label(k) for k, v in columns.items()])
+
+
+def union_all_queries(queries: list, s, o, ctx: Context) -> Select:
+    """UNION ALL multiple queries, filtering out None values."""
+    queries = [q for q in queries if q is not None]
+    if not queries:
+        raise ValueError("No valid queries to union")
+    if len(queries) == 1:
+        return queries[0]
+
+    result = queries[0]
+    for q in queries[1:]:
+        result = result.union_all(q)
+
+    return result
 
 
 # =============================================================================
@@ -1892,11 +1985,11 @@ class Translator:
     def _translate_select(self, select_query: CompValue) -> Select:
         """Translate a SelectQuery."""
         base_query = translate_pattern(select_query["p"], self._ctx(), self.engine)
-        return (
-            base_query
-            if isinstance(base_query, Select)
-            else select(*base_query.c).select_from(base_query)
-        )
+        if isinstance(base_query, SelectBase):
+            # Select or CompoundSelect (from UNION) - return directly
+            return base_query
+        # CTE - wrap in a SELECT
+        return select(*base_query.c).select_from(base_query)
 
     def _translate_ask(self, ask_query: CompValue) -> Select:
         """Translate an AskQuery to SELECT EXISTS(...)."""
