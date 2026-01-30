@@ -1260,6 +1260,8 @@ def _expand_path(s, path, o, ctx: Context) -> QueryResult:
         return _expand_sequence(s, path, o, ctx)
     if isinstance(path, MulPath):
         return _mulpath_to_cte(s, path, o, ctx)
+    if isinstance(path, InvPath):
+        return _expand_path(o, path.arg, s, ctx)
 
     raise NotImplementedError(f"Path type {type(path)} not implemented")
 

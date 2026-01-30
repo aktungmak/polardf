@@ -612,6 +612,8 @@ class TestNestedPaths(unittest.TestCase):
             "SELECT * WHERE { ?s <p>/<q>* ?o }",
             "SELECT * WHERE { ?s <p>*/<q> ?o }",
             "SELECT * WHERE { ?s <p>/<q>+/<r> ?o }",
+            "SELECT * WHERE { ?s ^<p>/<q> ?o }",
+            "SELECT * WHERE { ?s <p>/^<q> ?o }",
         ]
 
         for sparql in queries:
@@ -627,15 +629,55 @@ class TestNestedPaths(unittest.TestCase):
         compiled = sql_query.compile()
         self.assertIsNotNone(compiled)
 
-    def test_unimplemented_nested_path_raises(self):
-        """Test that unimplemented path types raise NotImplementedError."""
-        # InvPath (^) is not yet implemented
-        query = "SELECT * WHERE { ?s ^<p>/<q> ?o }"
+    def test_invpath_simple(self):
+        """Test simple inverse path (^) swaps subject and object."""
+        # Normal: alice --knows--> bob
+        # Inverse: bob <--knows-- alice => bob ^knows alice
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?who
+        WHERE { ex:bob ^ex:knows ?who }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
 
-        with self.assertRaises(NotImplementedError) as ctx:
-            self.translator.translate(query)
+        # Should find alice (who knows bob)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].who, "http://example.org/alice")
 
-        self.assertIn("InvPath", str(ctx.exception))
+    def test_invpath_in_sequence(self):
+        """Test inverse path in sequence: ^p/q."""
+        # Query: ?x ^knows/likes ?y
+        # Expands to: ?temp knows ?x, ?temp likes ?y
+        # bob knows charlie, bob likes eve => (charlie, eve)
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?x ?y
+        WHERE { ?x ^ex:knows/ex:likes ?y }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # bob knows charlie and bob likes eve => (charlie, eve)
+        found = {(row.x, row.y) for row in rows}
+        self.assertIn(("http://example.org/charlie", "http://example.org/eve"), found)
+
+    @unittest.expectedFailure  # TODO: complex inner paths in MulPath not yet supported
+    def test_invpath_nested_in_mulpath(self):
+        """Test inverse path with transitive closure: (^p)*."""
+        # alice --knows--> bob
+        # Using (^knows)* from bob should reach alice (1 hop) and bob (0 hops)
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?who
+        WHERE { ex:bob (^ex:knows)* ?who }
+        """
+        result = self.translator.execute(query)
+        whos = {row.who for row in result.fetchall()}
+
+        # Should include bob (zero-length) and alice (one inverse hop)
+        self.assertIn("http://example.org/bob", whos)
+        self.assertIn("http://example.org/alice", whos)
 
 
 class TestGroupByAndAggregates(unittest.TestCase):
