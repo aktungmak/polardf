@@ -522,9 +522,7 @@ class SparqlResultParser:
 
         return variables, bindings_list
 
-    def parse_tsv(
-        self, filepath: str
-    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def parse_tsv(self, filepath: str) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Parse SPARQL Results TSV format (.tsv).
 
         TSV format has a header row with variable names (prefixed with ?)
@@ -562,27 +560,76 @@ class SparqlResultParser:
 
         return variables, bindings_list
 
+    def parse_srj(
+        self, filepath: str
+    ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
+        """Parse SPARQL Results JSON format (.srj).
+
+        JSON format has head.vars for variable names and results.bindings
+        for the solution sequence. ASK queries use boolean instead.
+
+        Returns:
+            Tuple of (variable_names, list_of_bindings) for SELECT results
+            Tuple of ([], bool) for ASK results
+        """
+        import json
+
+        content = read_file_content(filepath)
+        data = json.loads(content)
+
+        # ASK query result
+        if "boolean" in data:
+            return [], data["boolean"]
+
+        variables = data.get("head", {}).get("vars", [])
+        bindings_list = []
+
+        for binding in data.get("results", {}).get("bindings", []):
+            row = {}
+            for var, val_obj in binding.items():
+                val_type = val_obj.get("type")
+                value = val_obj.get("value", "")
+
+                if val_type == "uri":
+                    row[var] = f"<{value}>"
+                elif val_type == "bnode":
+                    row[var] = f"_:{value}"
+                elif val_type == "literal":
+                    datatype = val_obj.get("datatype")
+                    lang = val_obj.get("xml:lang")
+                    if datatype:
+                        row[var] = f'"{value}"^^<{datatype}>'
+                    elif lang:
+                        row[var] = f'"{value}"@{lang}'
+                    else:
+                        row[var] = value
+            bindings_list.append(row)
+
+        return variables, bindings_list
+
     def parse(
         self, filepath: str
     ) -> Tuple[List[str], Union[List[Dict[str, Any]], bool]]:
-        """Parse results file, auto-detecting format."""
+        """Parse results file based on extension.
+
+        Raises:
+            ValueError: If the file format is not supported.
+        """
         ext = Path(filepath).suffix.lower()
 
-        if ext == ".srx":
-            return self.parse_srx(filepath)
-        elif ext == ".tsv":
-            return self.parse_tsv(filepath)
-        elif ext in (".ttl", ".rdf", ".n3"):
-            return self.parse_ttl_results(filepath)
-        else:
-            # Try formats in order
-            try:
-                return self.parse_srx(filepath)
-            except Exception:
-                try:
-                    return self.parse_tsv(filepath)
-                except Exception:
-                    return self.parse_ttl_results(filepath)
+        parsers = {
+            ".srx": self.parse_srx,
+            ".srj": self.parse_srj,
+            ".tsv": self.parse_tsv,
+            ".ttl": self.parse_ttl_results,
+            ".rdf": self.parse_ttl_results,
+            ".n3": self.parse_ttl_results,
+        }
+
+        if ext in parsers:
+            return parsers[ext](filepath)
+
+        raise ValueError(f"Unsupported result format: {ext}")
 
 
 def _try_parse_numeric(lexical: str) -> Optional[float]:
