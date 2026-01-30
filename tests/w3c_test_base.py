@@ -27,6 +27,7 @@ from rdflib.plugins.sparql import parser, algebra
 from sparql2sql.sparql2sql import (
     EMPTY_PROJECTION_MARKER,
     Translator,
+    _NUMERIC_TYPES,
     term_to_string,
     term_to_object_type,
     create_sqlite_engine,
@@ -584,15 +585,25 @@ class SparqlResultParser:
                     return self.parse_ttl_results(filepath)
 
 
+def _try_parse_numeric(lexical: str) -> Optional[float]:
+    """Try to parse a lexical value as a numeric. Returns None if not numeric."""
+    try:
+        return float(lexical)
+    except (ValueError, TypeError):
+        return None
+
+
 def normalise_value(value: Any) -> Any:
     """Normalise a value for comparison.
 
-    Converts SPARQL result format to our raw database format:
+    Converts SPARQL result format for comparison:
     - URIs: <http://...> -> http://...
-    - Typed literals: "value"^^<datatype> -> value
+    - Numeric typed literals: compared by numeric value (float)
+    - Other typed literals: "value"^^<datatype> -> value (lexical form)
     - Language-tagged: "value"@lang -> value
     - Plain literals: "value" or value -> value
     - BNodes: _:id -> _:id (unchanged)
+    - Plain numeric values: converted to float for comparison
     """
     if value is None:
         return None
@@ -614,11 +625,27 @@ def normalise_value(value: Any) -> Any:
 
     # Handle typed literals: "value"^^<datatype>
     if "^^" in s:
-        # Extract the lexical value (between quotes before ^^)
-        val_part = s.split("^^")[0]
+        parts = s.split("^^", 1)
+        val_part = parts[0]
+        datatype_part = parts[1] if len(parts) > 1 else ""
+
+        # Extract lexical value
         if val_part.startswith('"') and val_part.endswith('"'):
-            return val_part[1:-1]
-        return val_part
+            lexical = val_part[1:-1]
+        else:
+            lexical = val_part
+
+        # Extract datatype URI (strip angle brackets if present)
+        datatype = datatype_part.strip("<>")
+
+        # For numeric types, compare by numeric value
+        if datatype in _NUMERIC_TYPES:
+            numeric_val = _try_parse_numeric(lexical)
+            if numeric_val is not None:
+                return numeric_val
+
+        # Non-numeric typed literal: return lexical form
+        return lexical
 
     # Handle language-tagged literals: "value"@lang
     if "@" in s and s.count('"') >= 2:
@@ -632,7 +659,12 @@ def normalise_value(value: Any) -> Any:
     if s.startswith('"') and s.endswith('"'):
         return s[1:-1]
 
-    # Plain unquoted value - return as-is
+    # Plain unquoted value - try to parse as numeric for comparison
+    # This handles raw numeric results from SQL (e.g., "6.0" vs "6")
+    numeric_val = _try_parse_numeric(s)
+    if numeric_val is not None:
+        return numeric_val
+
     return s
 
 
