@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace, field
 from typing import Callable, Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, RDF, URIRef, XSD
-from rdflib.paths import MulPath, Path, SequencePath
+from rdflib.paths import AlternativePath, InvPath, MulPath, NegatedPath, Path, SequencePath
 from rdflib.plugins.sparql import algebra, parser
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.term import Variable
@@ -1230,25 +1230,54 @@ def triple_to_query(triple: tuple, ctx: Context) -> Select:
     return query
 
 
-def expand_triple(triple: tuple, ctx: Context) -> List[Select]:
-    """Expand a triple pattern into one or more Select queries.
+def _expand_path(s, path, o, ctx: Context) -> QueryResult:
+    """Recursively expand a property path to SQL.
 
-    Handles SequencePath and MulPath predicates.
+    Args:
+        s: Subject term (Variable, URIRef, BNode, or Literal)
+        path: Property path (URIRef or Path subclass)
+        o: Object term (Variable, URIRef, BNode, or Literal)
+        ctx: Translation context
+
+    Returns:
+        A single QueryResult representing the path pattern.
+    """
+    # Simple predicate - delegate to triple_to_query
+    if isinstance(path, URIRef):
+        return triple_to_query((s, path, o), ctx)
+
+    # Dispatch by path type
+    if isinstance(path, SequencePath):
+        return _expand_sequence(s, path, o, ctx)
+    if isinstance(path, MulPath):
+        return _mulpath_to_cte(s, path, o, ctx)
+
+    raise NotImplementedError(f"Path type {type(path)} not implemented")
+
+
+def _expand_sequence(s, seq: SequencePath, o, ctx: Context) -> QueryResult:
+    """Expand a sequence path (p/q/r) by joining recursive expansions."""
+    temp_vars = [Variable(f"_seq_{id(seq)}_{i}") for i in range(len(seq.args) - 1)]
+    nodes = [s] + temp_vars + [o]
+    queries = [
+        _expand_path(nodes[i], seq.args[i], nodes[i + 1], ctx)
+        for i in range(len(seq.args))
+    ]
+    return _bgp_join_queries(queries, ctx)
+
+
+def expand_triple(triple: tuple, ctx: Context) -> List[QueryResult]:
+    """Expand a triple pattern into a list of queries.
+
+    For simple predicates, returns a single-element list.
+    For path predicates, recursively expands and returns a single-element list.
     """
     s, p, o = triple
 
     if not isinstance(p, Path):
         return [triple_to_query(triple, ctx)]
 
-    if isinstance(p, SequencePath):
-        temp_vars = [Variable(f"_path_{id(p)}_{i}") for i in range(len(p.args) - 1)]
-        expanded = zip([s] + temp_vars, p.args, temp_vars + [o])
-        return [triple_to_query(t, ctx) for t in expanded]
-
-    if isinstance(p, MulPath):
-        return [_mulpath_to_cte(s, p, o, ctx)]
-
-    raise NotImplementedError(f"Path type {type(p)} not implemented")
+    return [_expand_path(s, p, o, ctx)]
 
 
 def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:

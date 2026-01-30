@@ -431,6 +431,148 @@ class TestMulPath(unittest.TestCase):
         self.assertNotIn("http://example.org/other1", reachable)
 
 
+class TestNestedPaths(unittest.TestCase):
+    """Tests for nested path expressions (e.g., p/q*, p*/q)."""
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        self.translator = Translator(
+            self.engine, table_name="triples", create_table=True
+        )
+
+        # Graph structure:
+        # alice --knows--> bob --knows--> charlie --knows--> diana
+        #                      \--likes--> eve
+        with self.engine.connect() as conn:
+            conn.execute(
+                self.translator.table.insert(),
+                [
+                    {
+                        "s": "http://example.org/alice",
+                        "p": "http://example.org/knows",
+                        "o": "http://example.org/bob",
+                        "ot": None,
+                    },
+                    {
+                        "s": "http://example.org/bob",
+                        "p": "http://example.org/knows",
+                        "o": "http://example.org/charlie",
+                        "ot": None,
+                    },
+                    {
+                        "s": "http://example.org/charlie",
+                        "p": "http://example.org/knows",
+                        "o": "http://example.org/diana",
+                        "ot": None,
+                    },
+                    {
+                        "s": "http://example.org/bob",
+                        "p": "http://example.org/likes",
+                        "o": "http://example.org/eve",
+                        "ot": None,
+                    },
+                ],
+            )
+            conn.commit()
+
+    def tearDown(self):
+        if hasattr(self, "engine"):
+            self.engine.dispose()
+
+    def test_sequence_then_mulpath(self):
+        """Test p/q* - sequence followed by transitive closure."""
+        # alice --knows--> bob --knows*--> {charlie, diana}
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?end
+        WHERE { ex:alice ex:knows/ex:knows* ?end }
+        """
+        result = self.translator.execute(query)
+        ends = {row.end for row in result.fetchall()}
+
+        # bob --knows*--> bob (via 0+ hops), charlie (1 hop), diana (2 hops)
+        # Note: zero-length path not yet implemented, so bob may not appear
+        self.assertIn("http://example.org/charlie", ends)
+        self.assertIn("http://example.org/diana", ends)
+
+    def test_mulpath_then_sequence(self):
+        """Test p*/q - transitive closure followed by simple predicate."""
+        # alice --knows*--> {alice, bob, charlie, diana} --likes--> eve
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?end
+        WHERE { ex:alice ex:knows*/ex:likes ?end }
+        """
+        result = self.translator.execute(query)
+        ends = {row.end for row in result.fetchall()}
+
+        # Only bob has a likes edge, so result should be eve
+        self.assertIn("http://example.org/eve", ends)
+
+    @unittest.expectedFailure  # TODO: Zero-length path support for MulPath (* and ?)
+    def test_mulpath_in_middle_of_sequence(self):
+        """Test p/q*/r - simple, transitive, simple."""
+        # alice --knows--> bob --knows*--> X --likes--> eve
+        # With zero-length path support, bob matches knows* with 0 hops
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?end
+        WHERE { ex:alice ex:knows/ex:knows*/ex:likes ?end }
+        """
+        result = self.translator.execute(query)
+        rows = result.fetchall()
+
+        # Should find path: alice -> bob -> (0 hops via knows*) -> likes -> eve
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].end, "http://example.org/eve")
+
+    @unittest.expectedFailure  # TODO: CTE name collision with multiple MulPaths
+    def test_two_mulpaths_in_sequence(self):
+        """Test p*/q* - two transitive closures in sequence."""
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?start ?end
+        WHERE { ?start ex:knows*/ex:likes* ?end }
+        """
+        _, sql_query = self.translator.translate(query)
+
+        # Should compile without error
+        compiled = sql_query.compile()
+        self.assertIsNotNone(compiled)
+
+    def test_nested_path_translation_compiles(self):
+        """Test that nested paths produce valid SQL."""
+        queries = [
+            "SELECT * WHERE { ?s <p>/<q>* ?o }",
+            "SELECT * WHERE { ?s <p>*/<q> ?o }",
+            "SELECT * WHERE { ?s <p>/<q>+/<r> ?o }",
+        ]
+
+        for sparql in queries:
+            with self.subTest(sparql=sparql):
+                _, sql_query = self.translator.translate(sparql)
+                compiled = sql_query.compile()
+                self.assertIsNotNone(compiled)
+
+    @unittest.expectedFailure  # TODO: CTE name collision with multiple MulPaths
+    def test_multiple_mulpaths_compile(self):
+        """Test that multiple MulPaths in sequence compile correctly."""
+        query = "SELECT * WHERE { ?s <p>?/<q>* ?o }"
+        _, sql_query = self.translator.translate(query)
+        compiled = sql_query.compile()
+        self.assertIsNotNone(compiled)
+
+    def test_unimplemented_nested_path_raises(self):
+        """Test that unimplemented path types raise NotImplementedError."""
+        # InvPath (^) is not yet implemented
+        query = "SELECT * WHERE { ?s ^<p>/<q> ?o }"
+
+        with self.assertRaises(NotImplementedError) as ctx:
+            self.translator.translate(query)
+
+        self.assertIn("InvPath", str(ctx.exception))
+
+
 class TestGroupByAndAggregates(unittest.TestCase):
     """Tests for GROUP BY and aggregate functions."""
 
