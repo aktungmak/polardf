@@ -15,7 +15,6 @@ from typing import Callable, Dict, List, Optional, Union
 
 from rdflib import BNode, Literal, RDF, URIRef, XSD
 from rdflib.paths import (
-    AlternativePath,
     InvPath,
     MulPath,
     NegatedPath,
@@ -164,6 +163,17 @@ def cols(query: QueryResult) -> Dict[str, Column]:
 def col_names(query: QueryResult) -> set:
     """Get set of column names from a query."""
     return set(cols(query).keys())
+
+
+def _as_select(query: QueryResult) -> tuple[Select, dict]:
+    """Convert query to Select with column mapping for further operations.
+
+    This helper standardises CTE and Select handling - both need column access
+    for expressions, but CTEs must be wrapped in SELECT for modification.
+    """
+    var_to_col = cols(query)
+    base = select(*query.c).select_from(query) if isinstance(query, CTE) else query
+    return base, var_to_col
 
 
 def _project_columns(
@@ -397,9 +407,7 @@ _NUMERIC_TYPES = {
 # Pre-computed SQL literals for type comparisons (avoid repeated list comprehensions)
 _NUMERIC_TYPE_LITERALS = tuple(literal(t) for t in _NUMERIC_TYPES)
 _ORDERABLE_TYPES = {str(XSD.string), str(XSD.dateTime), str(XSD.date), str(XSD.time)}
-_ORDERABLE_TYPE_LITERALS = tuple(
-    literal(str(t)) for t in (XSD.string, XSD.dateTime, XSD.date, XSD.time)
-)
+_ORDERABLE_TYPE_LITERALS = {literal(t) for t in _ORDERABLE_TYPES}
 
 # =============================================================================
 # Boolean Expression Detection (for projection)
@@ -442,7 +450,9 @@ def _bool_to_xsd_string(sql_expr):
 # =============================================================================
 
 # Valid EBV types: numerics, boolean, and string (plus plain literals handled separately)
-_EBV_VALID_TYPES = _NUMERIC_TYPES | {str(XSD.boolean), str(XSD.string)}
+_EBV_VALID_TYPE_LITERALS = {
+    literal(t) for t in _NUMERIC_TYPES | {str(XSD.boolean), str(XSD.string)}
+}
 
 
 def _ebv(value_col, type_col):
@@ -451,18 +461,18 @@ def _ebv(value_col, type_col):
     Returns NULL for type errors (unbound/unsupported), which filters the row.
     """
     is_plain = type_col.is_(None)
-    valid_types = [literal(t) for t in _EBV_VALID_TYPES]
-    numeric_types = [literal(t) for t in _NUMERIC_TYPES]
-
     return case(
         # Unbound
         (value_col.is_(None), null()),
-        # Invalid type
-        (not_(or_(is_plain, type_col.in_(valid_types))), null()),
+        # Invalid type (not plain and not in valid types)
+        (and_(type_col.isnot(None), type_col.not_in(_EBV_VALID_TYPE_LITERALS)), null()),
         # Boolean
         (type_col == literal(str(XSD.boolean)), value_col == literal("true")),
         # Numeric
-        (type_col.in_(numeric_types), func.cast(value_col, Float) != literal(0)),
+        (
+            type_col.in_(_NUMERIC_TYPE_LITERALS),
+            func.cast(value_col, Float) != literal(0),
+        ),
         # String
         (
             or_(is_plain, type_col == literal(str(XSD.string))),
@@ -755,7 +765,6 @@ def _expr_in(expr, var_to_col, engine):
 def _type_test_variable(fname, type_col, value_col):
     """Generate SQL condition for type test (isLiteral, isBlank, etc.) on a variable."""
     is_blank = value_col.like(literal("_:%"))
-    numeric_types = [literal(t) for t in _NUMERIC_TYPES]
 
     if fname == "ISLITERAL":
         return type_col.isnot(None) if type_col is not None else not_(true())
@@ -767,7 +776,11 @@ def _type_test_variable(fname, type_col, value_col):
             and_(type_col.is_(None), not_blank) if type_col is not None else not_blank
         )
     if fname == "ISNUMERIC":
-        return type_col.in_(numeric_types) if type_col is not None else not_(true())
+        return (
+            type_col.in_(_NUMERIC_TYPE_LITERALS)
+            if type_col is not None
+            else not_(true())
+        )
     return not_(true())
 
 
@@ -794,7 +807,8 @@ _BUILTINS: Dict[str, Callable] = {}
 def builtin_handler(*names: str):
     """Decorator to register a built-in function handler.
 
-    Handlers receive (expr, raw_args, args, var_to_col, engine) where:
+    Handlers receive (fname, expr, raw_args, args, var_to_col, engine) where:
+      - fname: the function name (e.g. "STRLEN", "BOUND")
       - expr: the original CompValue expression
       - raw_args: unevaluated argument expressions
       - args: translated SQLAlchemy column expressions
@@ -822,7 +836,7 @@ def _translate_builtin(expr, var_to_col, engine):
     # Dispatch to registered handler
     handler = _BUILTINS.get(fname)
     if handler:
-        return handler(expr, raw_args, args, var_to_col, engine)
+        return handler(fname, expr, raw_args, args, var_to_col, engine)
 
     raise NotImplementedError(f"SPARQL built-in function {fname} is not implemented")
 
@@ -877,53 +891,49 @@ for _builtin_name in [
 
 
 @builtin_handler("STRLEN", "UCASE", "LCASE", "ABS", "ROUND", "CEIL", "FLOOR")
-def _builtin_simple(expr, raw_args, args, var_to_col, engine):
+def _builtin_simple(fname, expr, raw_args, args, var_to_col, engine):
     """Handle simple built-ins that map directly to SQL functions."""
-    fname = expr.name[8:].upper()
     return _BUILTIN_SIMPLE[fname](*args)
 
 
 @builtin_handler("COALESCE")
-def _builtin_coalesce(expr, raw_args, args, var_to_col, engine):
+def _builtin_coalesce(fname, expr, raw_args, args, var_to_col, engine):
     """Handle COALESCE (SQLite requires at least 2 arguments)."""
     return func.coalesce(*args, null()) if len(args) < 2 else func.coalesce(*args)
 
 
 @builtin_handler("MD5", "SHA1", "SHA256", "SHA384", "SHA512")
-def _builtin_hash(expr, raw_args, args, var_to_col, engine):
+def _builtin_hash(fname, expr, raw_args, args, var_to_col, engine):
     """Handle hash functions."""
-    fname = expr.name[8:].upper()
     return getattr(func, fname.lower())(*args)
 
 
 @builtin_handler("RAND", "NOW")
-def _builtin_noarg(expr, raw_args, args, var_to_col, engine):
+def _builtin_noarg(fname, expr, raw_args, args, var_to_col, engine):
     """Handle no-argument built-ins."""
-    fname = expr.name[8:].upper()
     return _BUILTIN_NOARG[fname]()
 
 
 @builtin_handler("YEAR", "MONTH", "DAY", "HOURS", "MINUTES", "SECONDS")
-def _builtin_datetime(expr, raw_args, args, var_to_col, engine):
+def _builtin_datetime(fname, expr, raw_args, args, var_to_col, engine):
     """Handle datetime field extraction."""
-    fname = expr.name[8:].upper()
     return func.extract(fname.lower(), *args)
 
 
 @builtin_handler("IF")
-def _builtin_if(expr, raw_args, args, var_to_col, engine):
+def _builtin_if(fname, expr, raw_args, args, var_to_col, engine):
     """Handle IF(condition, then, else)."""
     return case((args[0], args[1]), else_=args[2])
 
 
 @builtin_handler("BOUND")
-def _builtin_bound(expr, raw_args, args, var_to_col, engine):
+def _builtin_bound(fname, expr, raw_args, args, var_to_col, engine):
     """Handle BOUND(?var) - true if variable is bound."""
     return args[0].isnot(None)
 
 
 @builtin_handler("SUBSTR")
-def _builtin_substr(expr, raw_args, args, var_to_col, engine):
+def _builtin_substr(fname, expr, raw_args, args, var_to_col, engine):
     """Handle SUBSTR(string, start [, length])."""
     string_arg = args[0] if args else translate_expr(expr.arg, var_to_col, engine)
     start = (
@@ -944,7 +954,7 @@ def _builtin_substr(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("CONCAT")
-def _builtin_concat(expr, raw_args, args, var_to_col, engine):
+def _builtin_concat(fname, expr, raw_args, args, var_to_col, engine):
     """Handle CONCAT(str1, str2, ...)."""
     if not args:
         return literal("")
@@ -955,13 +965,13 @@ def _builtin_concat(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("STR")
-def _builtin_str(expr, raw_args, args, var_to_col, engine):
+def _builtin_str(fname, expr, raw_args, args, var_to_col, engine):
     """Handle STR(term) - convert to string representation."""
     return args[0]
 
 
 @builtin_handler("STRSTARTS")
-def _builtin_strstarts(expr, raw_args, args, var_to_col, engine):
+def _builtin_strstarts(fname, expr, raw_args, args, var_to_col, engine):
     """Handle STRSTARTS(string, prefix)."""
     s = translate_expr(expr.arg1, var_to_col, engine)
     prefix = translate_expr(expr.arg2, var_to_col, engine)
@@ -969,7 +979,7 @@ def _builtin_strstarts(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("STRENDS")
-def _builtin_strends(expr, raw_args, args, var_to_col, engine):
+def _builtin_strends(fname, expr, raw_args, args, var_to_col, engine):
     """Handle STRENDS(string, suffix)."""
     s = translate_expr(expr.arg1, var_to_col, engine)
     suffix = translate_expr(expr.arg2, var_to_col, engine)
@@ -977,7 +987,7 @@ def _builtin_strends(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("CONTAINS")
-def _builtin_contains(expr, raw_args, args, var_to_col, engine):
+def _builtin_contains(fname, expr, raw_args, args, var_to_col, engine):
     """Handle CONTAINS(string, fragment)."""
     s = translate_expr(expr.arg1, var_to_col, engine)
     frag = translate_expr(expr.arg2, var_to_col, engine)
@@ -985,19 +995,19 @@ def _builtin_contains(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("REGEX")
-def _builtin_regex(expr, raw_args, args, var_to_col, engine):
+def _builtin_regex(fname, expr, raw_args, args, var_to_col, engine):
     """Handle REGEX(string, pattern [, flags])."""
     return _translate_regex(expr, var_to_col, engine)
 
 
 @builtin_handler("REPLACE")
-def _builtin_replace(expr, raw_args, args, var_to_col, engine):
+def _builtin_replace(fname, expr, raw_args, args, var_to_col, engine):
     """Handle REPLACE - not yet implemented."""
     raise NotImplementedError("REPLACE is dialect-specific and not implemented")
 
 
 @builtin_handler("SAMETERM")
-def _builtin_sameterm(expr, raw_args, args, var_to_col, engine):
+def _builtin_sameterm(fname, expr, raw_args, args, var_to_col, engine):
     """Handle sameTerm(a, b) - strict term equality."""
     arg1 = translate_expr(expr.arg1, var_to_col, engine)
     arg2 = translate_expr(expr.arg2, var_to_col, engine)
@@ -1013,9 +1023,8 @@ def _builtin_sameterm(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("ISLITERAL", "ISBLANK", "ISIRI", "ISURI", "ISNUMERIC")
-def _builtin_type_test(expr, raw_args, args, var_to_col, engine):
+def _builtin_type_test(fname, expr, raw_args, args, var_to_col, engine):
     """Handle type test functions (isLiteral, isBlank, isIRI, isURI, isNumeric)."""
-    fname = expr.name[8:].upper()
     arg_expr = raw_args[0] if raw_args else None
     if isinstance(arg_expr, Variable):
         type_col = _get_type_column(arg_expr, var_to_col)
@@ -1025,7 +1034,7 @@ def _builtin_type_test(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("LANG")
-def _builtin_lang(expr, raw_args, args, var_to_col, engine):
+def _builtin_lang(fname, expr, raw_args, args, var_to_col, engine):
     """Handle LANG(literal) - returns language tag or empty string."""
     # LANG returns the language tag of a literal, or "" if none
     # For non-literals (URIs, blank nodes), return NULL to trigger error semantics
@@ -1050,7 +1059,7 @@ def _builtin_lang(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("LANGMATCHES")
-def _builtin_langmatches(expr, raw_args, args, var_to_col, engine):
+def _builtin_langmatches(fname, expr, raw_args, args, var_to_col, engine):
     """Handle LANGMATCHES(lang_tag, lang_range) - BCP 47 language matching."""
     lang_tag = translate_expr(expr.arg1, var_to_col, engine)
     range_val = translate_expr(expr.arg2, var_to_col, engine)
@@ -1070,7 +1079,7 @@ def _builtin_langmatches(expr, raw_args, args, var_to_col, engine):
 
 
 @builtin_handler("DATATYPE")
-def _builtin_datatype(expr, raw_args, args, var_to_col, engine):
+def _builtin_datatype(fname, expr, raw_args, args, var_to_col, engine):
     """Handle DATATYPE(literal) - returns datatype IRI."""
     # DATATYPE returns the datatype IRI of a literal
     # For non-literals (URIs, blank nodes), return NULL (error semantics)
@@ -1298,11 +1307,11 @@ def _expand_negated_path(s, negpath: NegatedPath, o, ctx: Context) -> QueryResul
         base = triple_to_query((subj, pred_var, obj), ctx)
         return base.where(~ctx.table.c.p.in_(excluded)) if excluded else base
 
-    queries = (
-        [build(s, o, forward)] if forward or not inverse else []
-    ) + ([build(o, s, inverse)] if inverse else [])
+    queries = ([build(s, o, forward)] if forward or not inverse else []) + (
+        [build(o, s, inverse)] if inverse else []
+    )
 
-    return queries[0] if len(queries) == 1 else union_all_queries(queries, s, o, ctx)
+    return queries[0] if len(queries) == 1 else union_all_queries(queries)
 
 
 def expand_triple(triple: tuple, ctx: Context) -> List[QueryResult]:
@@ -1347,7 +1356,7 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
             base_query.cte(), s, o, s_value, o_value, o_type, ctx
         )
         zero_len = _zero_length_query(s, o, s_value, o_value, ctx)
-        return union_all_queries([one_hop, zero_len], s, o, ctx)
+        return union_all_queries([one_hop, zero_len])
 
     ctx, cte_name = ctx.next_cte_name()
     path_cte = base_query.cte(name=f"path_{cte_name}", recursive=True)
@@ -1381,7 +1390,7 @@ def _mulpath_to_cte(s, mulpath: MulPath, o, ctx: Context) -> Select:
     # For p* (zero-or-more), UNION with zero-length paths
     if mulpath.zero:
         zero_len = _zero_length_query(s, o, s_value, o_value, ctx)
-        return union_all_queries([positive_paths, zero_len], s, o, ctx)
+        return union_all_queries([positive_paths, zero_len])
 
     return positive_paths
 
@@ -1464,7 +1473,7 @@ def _literal_row(columns: dict) -> Select:
     return select(*[literal(v).label(k) for k, v in columns.items()])
 
 
-def union_all_queries(queries: list, s, o, ctx: Context) -> Select:
+def union_all_queries(queries: list) -> Select:
     """UNION ALL multiple queries, filtering out None values."""
     queries = [q for q in queries if q is not None]
     if not queries:
@@ -1726,14 +1735,7 @@ def _pattern_project(node: CompValue, ctx: Context, engine) -> QueryResult:
 @pattern_handler("Filter")
 def _pattern_filter(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Filter operation."""
-    inner_query = translate_pattern(node["p"], ctx, engine)
-
-    if isinstance(inner_query, CTE):
-        var_to_col = cols(inner_query)
-        base_select = select(*inner_query.c).select_from(inner_query)
-    else:
-        var_to_col = cols(inner_query)
-        base_select = inner_query
+    base_select, var_to_col = _as_select(translate_pattern(node["p"], ctx, engine))
 
     # Apply EBV if the filter expression is a bare variable
     filter_expr = node["expr"]
@@ -1801,14 +1803,7 @@ def _pattern_extend(node: CompValue, ctx: Context, engine) -> QueryResult:
 @pattern_handler("OrderBy")
 def _pattern_order_by(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate OrderBy operation."""
-    inner_query = translate_pattern(node["p"], ctx, engine)
-
-    if isinstance(inner_query, CTE):
-        var_to_col = cols(inner_query)
-        base_select = select(*inner_query.c).select_from(inner_query)
-    else:
-        var_to_col = cols(inner_query)
-        base_select = inner_query
+    base_select, var_to_col = _as_select(translate_pattern(node["p"], ctx, engine))
 
     order_clauses = []
     for cond in node["expr"]:
@@ -1836,12 +1831,7 @@ def _pattern_slice(node: CompValue, ctx: Context, engine) -> QueryResult:
     """Translate Slice (LIMIT/OFFSET) operation."""
     start = getattr(node, "start", 0)
     length = getattr(node, "length", None)
-    inner_query = translate_pattern(node["p"], ctx, engine)
-
-    if isinstance(inner_query, CTE):
-        result = select(*inner_query.c).select_from(inner_query)
-    else:
-        result = inner_query
+    result, _ = _as_select(translate_pattern(node["p"], ctx, engine))
 
     if length is not None:
         result = result.limit(length)
