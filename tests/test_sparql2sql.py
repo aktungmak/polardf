@@ -679,6 +679,69 @@ class TestNestedPaths(unittest.TestCase):
         self.assertIn("http://example.org/bob", whos)
         self.assertIn("http://example.org/alice", whos)
 
+    def test_negated_path_simple(self):
+        """Test simple negated path (!p) excludes specified predicate."""
+        # Graph: alice --knows--> bob, bob --knows--> charlie, bob --likes--> eve
+        # Query: bob !knows ?o => should get eve (via likes), not charlie (via knows)
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?o
+        WHERE { ex:bob !ex:knows ?o }
+        """
+        result = self.translator.execute(query)
+        objs = {row.o for row in result.fetchall()}
+
+        self.assertIn("http://example.org/eve", objs)
+        self.assertNotIn("http://example.org/charlie", objs)
+
+    def test_negated_path_multiple(self):
+        """Test negated path with multiple exclusions !(p|q)."""
+        # Exclude both knows and likes
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?o
+        WHERE { ?s !(ex:knows|ex:likes) ?o }
+        """
+        result = self.translator.execute(query)
+        preds_found = {(row.s, row.o) for row in result.fetchall()}
+
+        # Should NOT find any knows or likes edges
+        self.assertNotIn(
+            ("http://example.org/alice", "http://example.org/bob"), preds_found
+        )
+        self.assertNotIn(
+            ("http://example.org/bob", "http://example.org/eve"), preds_found
+        )
+
+    def test_negated_inverse_path(self):
+        """Test negated inverse path (!^p)."""
+        # Query: bob !^knows ?who => find ?who where NOT (?who knows bob)
+        # alice knows bob, so alice should be excluded
+        query = """
+        PREFIX ex: <http://example.org/>
+        SELECT ?who
+        WHERE { ex:bob !^ex:knows ?who }
+        """
+        result = self.translator.execute(query)
+        whos = {row.who for row in result.fetchall()}
+
+        # alice knows bob, so she should NOT appear
+        self.assertNotIn("http://example.org/alice", whos)
+
+    def test_negated_path_compiles(self):
+        """Test that negated paths produce valid SQL."""
+        queries = [
+            "SELECT * WHERE { ?s !<p> ?o }",
+            "SELECT * WHERE { ?s !(<p>|<q>) ?o }",
+            "SELECT * WHERE { ?s !^<p> ?o }",
+            "SELECT * WHERE { ?s !(<p>|^<q>) ?o }",
+        ]
+        for sparql in queries:
+            with self.subTest(sparql=sparql):
+                _, sql_query = self.translator.translate(sparql)
+                compiled = sql_query.compile()
+                self.assertIsNotNone(compiled)
+
 
 class TestGroupByAndAggregates(unittest.TestCase):
     """Tests for GROUP BY and aggregate functions."""

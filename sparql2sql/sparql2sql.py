@@ -1262,6 +1262,8 @@ def _expand_path(s, path, o, ctx: Context) -> QueryResult:
         return _mulpath_to_cte(s, path, o, ctx)
     if isinstance(path, InvPath):
         return _expand_path(o, path.arg, s, ctx)
+    if isinstance(path, NegatedPath):
+        return _expand_negated_path(s, path, o, ctx)
 
     raise NotImplementedError(f"Path type {type(path)} not implemented")
 
@@ -1275,6 +1277,32 @@ def _expand_sequence(s, seq: SequencePath, o, ctx: Context) -> QueryResult:
         for i in range(len(seq.args))
     ]
     return _bgp_join_queries(queries, ctx)
+
+
+def _expand_negated_path(s, negpath: NegatedPath, o, ctx: Context) -> QueryResult:
+    """Expand negated path (!p) using NOT IN clause.
+
+    Reuses triple_to_query with a placeholder predicate, adding NOT IN filter.
+    """
+    forward = [term_to_string(a) for a in negpath.args if isinstance(a, URIRef)]
+    inverse = [
+        term_to_string(a.arg)
+        for a in negpath.args
+        if isinstance(a, InvPath) and isinstance(a.arg, URIRef)
+    ]
+
+    # Placeholder predicate variable (filtered out in projection)
+    pred_var = Variable(f"_negp_{id(negpath)}")
+
+    def build(subj, obj, excluded):
+        base = triple_to_query((subj, pred_var, obj), ctx)
+        return base.where(~ctx.table.c.p.in_(excluded)) if excluded else base
+
+    queries = (
+        [build(s, o, forward)] if forward or not inverse else []
+    ) + ([build(o, s, inverse)] if inverse else [])
+
+    return queries[0] if len(queries) == 1 else union_all_queries(queries, s, o, ctx)
 
 
 def expand_triple(triple: tuple, ctx: Context) -> List[QueryResult]:
